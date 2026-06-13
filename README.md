@@ -1,64 +1,34 @@
-# Dvenue Backend (Gateway)
+# Dvenue Backend
 
 Node.js / Express backend for the Dvenue Flutter app.
 
-This service is the **only** thing the Flutter client talks to. It proxies to Supabase (OTP etc.), Firebase, and the dedicated **payments** service.
+The Flutter client should talk only to this backend. The backend verifies Firebase ID tokens, owns Firestore writes, proxies payments, and enforces role/ownership checks for listings, booking enquiries, staff, and admin actions.
 
 ## Setup
 
-### Easiest way (recommended)
+1. Copy the environment template:
 
-From the **project root** (Dvenue folder), just double-click:
-
-```
-start.bat
-```
-
-This does the following:
-- Kills any old processes on ports 4000 and 4001 first (avoids `EADDRINUSE`)
-- Launches both the backend (4000) and payments (4001) in separate titled PowerShell windows
-- Shows live output and writes to `logs/backend.log` + `logs/payments.log`
-
-You can also manually force-kill with:
-
-```
-kill-servers.bat
-```
-
-### Manual setup
-
-1. Copy env (same Firebase keys as the payments service):
    ```bash
    cp .env.example .env
    ```
 
-2. Install:
+2. Install dependencies:
+
    ```bash
    npm install
    ```
 
-3. Run (in its own terminal):
+3. Run the service:
+
    ```bash
    npm run dev
    ```
 
-Port 4000 (configure `PORT` and `PAYMENTS_SERVICE_URL=http://localhost:4001` if payments runs elsewhere).
+The default port is `4000`. Set `PAYMENTS_SERVICE_URL=http://localhost:4001` when the payments service is running locally.
 
-> **Tip:** Always start the payments service before or at the same time as the backend in development.
+## Firebase
 
-## Payment Flow (new)
-
-- `/api/payments/create-order` and `/api/payments/verify` are forwarded to the payments server.
-- Legacy `/bookings/:id/pay` now creates a real Razorpay order (via proxy) and returns it so the client can open checkout.
-- After the client completes payment in the Razorpay modal it must call verify (the Flutter code does this automatically).
-
-See the payments/ folder (especially arch.md) for the full picture.
-
-## Firebase Configuration
-
-All Firebase settings are loaded from environment variables (never hardcoded).
-
-See [.env.example](.env.example) for the required keys:
+The public Firebase web settings are required:
 
 - `FIREBASE_API_KEY`
 - `FIREBASE_AUTH_DOMAIN`
@@ -67,32 +37,54 @@ See [.env.example](.env.example) for the required keys:
 - `FIREBASE_MESSAGING_SENDER_ID`
 - `FIREBASE_APP_ID`
 
-These come from your Firebase project settings → Web app configuration.
+The secured API also requires Firebase Admin credentials:
 
-**Security note:** The `.env` file is gitignored. Never commit real credentials.
+- `FIREBASE_SERVICE_ACCOUNT_BASE64` preferred for hosted environments
+- `FIREBASE_SERVICE_ACCOUNT_JSON` for local JSON strings
 
-## Usage in code
+Without one of those Admin credential variables, Firestore/auth-backed routes return `503` and do not fall back to insecure access.
 
-```js
-import app, { db, auth, storage } from './firebase.config.js';
+Create a base64 value from a Firebase service account JSON file:
 
-// Use Firestore, Auth, or Storage as needed
+```powershell
+[Convert]::ToBase64String([IO.File]::ReadAllBytes("firebase-service-account.json"))
 ```
 
-## API Routes
+Never commit `.env`, service account JSON files, or private keys.
 
-- `GET /health` – Health check + current Firebase project + payments service status
-- `GET /api/example` – Sample protected-style route
-- Payment proxy routes (forwarded to payments service):
-  - `POST /api/payments/create-order`
-  - `POST /api/payments/verify`
-  - `POST /bookings/:bookingId/pay` (legacy compatibility)
+## Auth Model
 
-Add your real routes under `/api` to match the Flutter client's `ApiConfig.apiRoot`.
+- Login uses Firebase Identity Toolkit email/password auth and returns a Firebase ID token.
+- Protected routes require `Authorization: Bearer <Firebase ID token>`.
+- The backend verifies tokens with Firebase Admin and reads the user role from `users/{uid}`.
+- `DEFAULT_ADMIN_EMAIL` promotes the matching first profile to `admin`.
 
-## Next Steps (typical for this project)
+## Main Routes
 
-- Add Supabase admin client for OTP / auth proxying
-- Add payment provider integration (Stripe, etc.)
-- Protect routes with proper auth middleware
-- Add CORS for the Flutter app origins
+- `GET /health`
+- `POST /api/auth/login`
+- `POST /api/auth/signup/start`
+- `POST /api/auth/signup/complete`
+- `GET /api/auth/me`
+- `GET /api/venues/explore`
+- `GET /api/venues/search`
+- `GET /api/venues/:id`
+- `GET /api/venues/:id/availability`
+- `GET /api/venues/mine`
+- `POST /api/venues`
+- `PUT /api/venues/:id`
+- `DELETE /api/venues/:id`
+- `GET /api/bookings/mine`
+- `POST /api/bookings`
+- `POST /bookings/:bookingId/pay`
+- `GET /api/admin/listings`
+- `GET /api/admin/bookings`
+- `POST /api/venues/admin/:id/approve`
+- `POST /api/venues/admin/:id/reject`
+- `GET /api/staff`
+
+## Production Notes
+
+- Set `CORS_ORIGINS` to the deployed Flutter URL, for example `https://dvenueapp.vercel.app`.
+- Build Flutter with `--dart-define=API_BASE_URL=<backend-url>` when you are ready to connect the frontend to this backend.
+- No service can be "unhackable"; this backend uses the practical baseline: Firebase Admin token verification, server-side Firestore writes, role checks, ownership checks, rate limits, Helmet headers, and fail-closed config guards.
