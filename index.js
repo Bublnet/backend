@@ -1093,17 +1093,21 @@ app.use((req, res) => {
   res.status(404).json({ ok: false, message: 'Route not found.' });
 });
 
-const server = app.listen(PORT, () => {
-  console.log(`Dvenue backend running on http://localhost:${PORT}`);
-  console.log(`Payments service expected at: ${PAYMENTS_URL}`);
-  console.log(`Firebase project: ${process.env.FIREBASE_PROJECT_ID}`);
-});
+if (!process.env.VERCEL) {
+  const server = app.listen(PORT, () => {
+    console.log(`Dvenue backend running on http://localhost:${PORT}`);
+    console.log(`Payments service expected at: ${PAYMENTS_URL}`);
+    console.log(`Firebase project: ${process.env.FIREBASE_PROJECT_ID}`);
+  });
 
-server.on('error', (err) => {
-  if (err.code === 'EADDRINUSE') {
-    console.error(`Port ${PORT} is already in use. Run kill-servers.bat, then start again.`);
+  server.on('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+      console.error(`Port ${PORT} is already in use. Run kill-servers.bat, then start again.`);
+      process.exit(1);
+    }
+    console.error('Server error:', err);
     process.exit(1);
-  }
-  console.error('Server error:', err);
-  process.exit(1);
-});
+  });
+}
+
+export default app;
