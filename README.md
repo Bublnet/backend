@@ -62,11 +62,13 @@ Never commit `.env`, service account JSON files, or private keys.
 ## Main Routes
 
 - `GET /health`
-- `POST /api/auth/login`
-- `POST /api/auth/signup/start`
-- `POST /api/auth/signup/complete`
-- `GET /api/auth/me`
-- `GET /api/venues/explore`
+- `GET /api/config/public`
+- `POST /api/auth/login` ...
+- `GET /api/auth/me` (now also returns access snapshot)
+- `GET /api/access/status`
+- `POST /api/access/grant-ad` (after 30s frontend ad succeeds)
+- `POST /api/access/activate-premium`
+- `GET /api/venues/explore` (now requires valid token + (premium OR recent ad grant))
 - `GET /api/venues/search`
 - `GET /api/venues/:id`
 - `GET /api/venues/:id/availability`
@@ -77,14 +79,27 @@ Never commit `.env`, service account JSON files, or private keys.
 - `GET /api/bookings/mine`
 - `POST /api/bookings`
 - `POST /bookings/:bookingId/pay`
+- `POST /api/payments/*`
 - `GET /api/admin/listings`
 - `GET /api/admin/bookings`
 - `POST /api/venues/admin/:id/approve`
 - `POST /api/venues/admin/:id/reject`
 - `GET /api/staff`
 
+## Access Model (Production Security)
+- All DB read routes that surface venues, bookings, availability, dashboards now require:
+  1. Valid Firebase ID token (Authorization: Bearer ...)
+  2. User must be premium (isPremium flag) OR have a recent adAccessUntil (soft TTL, default 45min, granted by /grant-ad after frontend 30s ad completion).
+- Staff/admin roles bypass the premium/ad requirement for operational access.
+- Writes: protected by requireAuth + access (owner checks remain for self-owned listings/bookings). Admin-only review/approve routes use requireStaff/requireAdmin.
+- Payments for premium: `type: 'premium'` on create/verify auto-activates isPremium on the user profile (Firebase) + Supabase.
+- 402 "ACCESS_REQUIRED" returned when access missing. Frontend shows the 30s ad template or premium upsell.
+
 ## Production Notes
 
 - Set `CORS_ORIGINS` to the deployed Flutter URL, for example `https://dvenueapp.vercel.app`.
+- For **local testing**, copy `.env.example` → `.env` and ensure it includes your Flutter dev server:
+  - Default Flutter web: `http://localhost:8080,http://127.0.0.1:8080`
+  - Also add `http://localhost:5000` if your Flutter instance uses that port.
 - Build Flutter with `--dart-define=API_BASE_URL=<backend-url>` when you are ready to connect the frontend to this backend.
 - No service can be "unhackable"; this backend uses the practical baseline: Firebase Admin token verification, server-side Firestore writes, role checks, ownership checks, rate limits, Helmet headers, and fail-closed config guards.

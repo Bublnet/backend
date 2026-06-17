@@ -1,4 +1,6 @@
 import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import express from 'express';
@@ -8,8 +10,14 @@ import { getAuth } from 'firebase-admin/auth';
 import { FieldValue, getFirestore } from 'firebase-admin/firestore';
 import helmet from 'helmet';
 import fetch from 'node-fetch';
+import { fileURLToPath } from 'url';
 
 dotenv.config();
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const localServiceAccountPath = path.join(__dirname, 'inventory-management-ce97e-firebase-adminsdk-r6egv-3376080a19.json');
+const hasLocalServiceAccount = fs.existsSync(localServiceAccountPath);
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -18,11 +26,17 @@ const FIREBASE_API_KEY = process.env.FIREBASE_API_KEY;
 const DEFAULT_ADMIN_EMAIL = process.env.DEFAULT_ADMIN_EMAIL;
 const AUTH_OTP_TTL_MS = Number(process.env.AUTH_OTP_TTL_MS || 10 * 60 * 1000);
 const authBaseUrl = `https://identitytoolkit.googleapis.com/v1/accounts`;
+
+// Defaults set for current "simulate OTP, google removed" mode. Override via .env
+const ENABLE_OTP_VERIFY = (process.env.ENABLE_OTP_VERIFY || 'false').toLowerCase() === 'true';
+const ENABLE_GOOGLE_SIGNIN = (process.env.ENABLE_GOOGLE_SIGNIN || 'false').toLowerCase() === 'true';
+
 const hasFirebaseServerCredentials = Boolean(
   process.env.FIREBASE_SERVICE_ACCOUNT_JSON
     || process.env.FIREBASE_SERVICE_ACCOUNT_BASE64
     || process.env.GOOGLE_APPLICATION_CREDENTIALS
-    || process.env.K_SERVICE,
+    || process.env.K_SERVICE
+    || hasLocalServiceAccount,
 );
 
 function initFirebaseAdmin() {
@@ -31,21 +45,28 @@ function initFirebaseAdmin() {
   const rawJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
   const base64Json = process.env.FIREBASE_SERVICE_ACCOUNT_BASE64;
 
+  let credential;
   if (rawJson || base64Json) {
     const parsed = JSON.parse(
       rawJson || Buffer.from(base64Json, 'base64').toString('utf8'),
     );
-    return initializeApp({
-      credential: cert(parsed),
-      storageBucket: process.env.FIREBASE_STORAGE_BUCKET,
-    });
+    credential = cert(parsed);
+  } else if (hasLocalServiceAccount) {
+    const parsed = JSON.parse(fs.readFileSync(localServiceAccountPath, 'utf8'));
+    credential = cert(parsed);
+  } else {
+    credential = applicationDefault();
   }
 
-  return initializeApp({
-    credential: applicationDefault(),
-    projectId: process.env.FIREBASE_PROJECT_ID,
+  const appConfig = {
+    credential,
     storageBucket: process.env.FIREBASE_STORAGE_BUCKET,
-  });
+  };
+  if (!rawJson && !base64Json && !hasLocalServiceAccount && process.env.FIREBASE_PROJECT_ID) {
+    appConfig.projectId = process.env.FIREBASE_PROJECT_ID;
+  }
+
+  return initializeApp(appConfig);
 }
 
 initFirebaseAdmin();
@@ -56,7 +77,7 @@ const auth = getAuth();
 function assertFirebaseServerConfigured() {
   if (hasFirebaseServerCredentials) return;
   const error = new Error(
-    'Firebase server credentials are required. Set FIREBASE_SERVICE_ACCOUNT_JSON or FIREBASE_SERVICE_ACCOUNT_BASE64.',
+    'Firebase server credentials are required. Set GOOGLE_APPLICATION_CREDENTIALS (path to your service-account.json), FIREBASE_SERVICE_ACCOUNT_JSON, or FIREBASE_SERVICE_ACCOUNT_BASE64.',
   );
   error.status = 503;
   throw error;
@@ -68,16 +89,33 @@ const allowedOrigins = (process.env.CORS_ORIGINS || '')
   .filter(Boolean);
 
 app.set('trust proxy', 1);
-app.use(helmet({ crossOriginResourcePolicy: false }));
-app.use(express.json({ limit: '2mb' }));
+
+// CORS early (before helmet/json) so that preflight for authenticated cross-origin calls
+// (Flutter web on :8080 talking to either backend) receive ACAO + credentials headers.
 app.use(cors({
   origin(origin, callback) {
-    if (!origin || allowedOrigins.length === 0 || allowedOrigins.includes(origin)) {
+    if (!origin) return callback(null, true);
+
+    // Robust localhost support for Flutter web dev (any port like 8080)
+    if (/^https?:\/\/(localhost|127\.0\.0\.1|::1)(:\d+)?$/.test(origin) || origin.includes('localhost')) {
       return callback(null, true);
     }
+
+    if (allowedOrigins.length === 0 || allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+
     return callback(new Error('Origin not allowed'));
   },
+  credentials: true,
+  methods: ['GET', 'HEAD', 'PUT', 'PATCH', 'POST', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'Origin', 'X-Requested-With'],
+  optionsSuccessStatus: 200,
 }));
+app.options('*', cors());
+
+app.use(helmet({ crossOriginResourcePolicy: false }));
+app.use(express.json({ limit: '2mb' }));
 
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -127,6 +165,8 @@ function publicUser(profile) {
     name: profile.name || 'Dvenue User',
     identifier: profile.identifier || profile.email || '',
     role: profile.role || 'client',
+    isPremium: profile.isPremium === true || profile.is_premium === true,
+    adAccessUntil: profile.adAccessUntil || profile.ad_access_until || null,
   };
 }
 
@@ -153,6 +193,8 @@ async function ensureUserProfile(uid, fallback = {}) {
     identifier: existing.identifier || fallback.identifier || email,
     email,
     role,
+    isPremium: existing.isPremium === true || existing.is_premium === true,
+    adAccessUntil: existing.adAccessUntil || existing.ad_access_until || null,
     updatedAt: nowIso(),
     ...(snap.exists ? {} : { createdAt: nowIso() }),
   };
@@ -198,6 +240,41 @@ function requireRole(roles) {
 const requireStaff = requireRole(['admin', 'manager', 'support', 'reviewer']);
 const requireAdmin = requireRole(['admin']);
 
+async function requireAccess(req, res, next) {
+  try {
+    // Must be after requireAuth
+    if (!req.auth || !req.auth.user) {
+      return res.status(401).json({ ok: false, message: 'Authentication required.' });
+    }
+    const profile = req.auth.profile || {};
+    const isPremium = profile.isPremium === true || profile.is_premium === true;
+    const adRaw = profile.adAccessUntil || profile.ad_access_until;
+    let hasAd = false;
+    if (adRaw) {
+      const until = typeof adRaw === 'string' ? new Date(adRaw) : (adRaw && adRaw.toDate ? adRaw.toDate() : new Date(adRaw));
+      hasAd = until instanceof Date && !Number.isNaN(until.getTime()) && until.getTime() > Date.now();
+    }
+    const role = req.auth.user.role;
+    const isPrivileged = ['admin', 'manager', 'support', 'reviewer'].includes(role);
+    if (!isPremium && !hasAd && !isPrivileged) {
+      return res.status(402).json({
+        ok: false,
+        message: 'Premium subscription or ad-supported access required. Watch a short ad to continue or upgrade.',
+        code: 'ACCESS_REQUIRED',
+        isPremium: false,
+        hasAdAccess: false,
+      });
+    }
+    req.access = { isPremium: !!isPremium, hasAdAccess: !!hasAd };
+    return next();
+  } catch (e) {
+    console.error('Access check error', e);
+    return res.status(403).json({ ok: false, message: 'Access check failed.' });
+  }
+}
+
+const requirePremiumOrAd = [requireAuth, requireAccess];
+
 function toListing(doc) {
   const data = doc.data ? doc.data() : doc;
   const id = doc.id || data.id;
@@ -229,15 +306,19 @@ function toListing(doc) {
     rating: Number(data.rating || 0),
     imageEmoji: data.imageEmoji || 'pin',
     images: Array.isArray(data.images) ? data.images : [],
+    thumbnails: Array.isArray(data.thumbnails) ? data.thumbnails : [],
     specTable: data.specTable || { rows: [] },
     status: data.status || 'pending',
     ownerId: data.ownerId || null,
     ownerName: data.ownerName || null,
+    submittedAt: data.submittedAt || null,
     verified: data.verified === true,
     verificationStatus: data.verificationStatus || 'pending_contact',
     verificationNotes: data.verificationNotes || null,
     contactedAt: data.contactedAt || null,
     rejectionReason: data.rejectionReason || null,
+    approvedAt: data.approvedAt || null,
+    updatedAt: data.updatedAt || null,
   };
 }
 
@@ -372,6 +453,30 @@ function mapFirebaseAuthError(code) {
   }
 }
 
+async function googleIdentityToolkit(idToken) {
+  if (!FIREBASE_API_KEY) {
+    const error = new Error('Firebase API key is not configured.');
+    error.status = 500;
+    throw error;
+  }
+  const response = await fetch(`${authBaseUrl}:signInWithIdp?key=${FIREBASE_API_KEY}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      postBody: `id_token=${encodeURIComponent(idToken)}&providerId=google.com`,
+      requestUri: 'http://localhost',
+      returnSecureToken: true,
+    }),
+  });
+  const data = await response.json();
+  if (!response.ok) {
+    const error = new Error(mapFirebaseAuthError(data?.error?.message) || 'Google sign-in failed.');
+    error.status = 400;
+    throw error;
+  }
+  return data;
+}
+
 async function handleError(res, error) {
   console.error(error);
   return res.status(error.status || 500).json({
@@ -402,17 +507,66 @@ app.get('/api/config/public', (req, res) => {
   res.json({
     ok: true,
     razorpayKeyId: process.env.RAZORPAY_KEY_ID || null,
+    enableOtpVerify: ENABLE_OTP_VERIFY,
+    enableGoogleSignin: ENABLE_GOOGLE_SIGNIN,
   });
 });
 
 app.get('/api/auth/me', requireAuth, (req, res) => {
+  const profile = req.auth.profile || {};
+  const isPremium = profile.isPremium === true || profile.is_premium === true;
+  const adRaw = profile.adAccessUntil || profile.ad_access_until;
+  let adAccessUntil = null;
+  if (adRaw) {
+    const d = typeof adRaw === 'string' ? new Date(adRaw) : (adRaw && adRaw.toDate ? adRaw.toDate() : new Date(adRaw));
+    if (d instanceof Date && !Number.isNaN(d.getTime())) adAccessUntil = d.toISOString();
+  }
+  const role = req.auth.user.role;
+  const hasAccess = isPremium || ['admin', 'manager', 'support', 'reviewer'].includes(role) || (adAccessUntil && new Date(adAccessUntil).getTime() > Date.now());
   res.json({
     ok: true,
     data: {
       token: req.auth.token,
       user: req.auth.user,
+      access: {
+        isPremium: !!isPremium,
+        adAccessUntil,
+        hasAccess: !!hasAccess,
+      },
     },
   });
+});
+
+// Profiles (support SessionStore.getManualLocation + saveManualLocation + other profile reads)
+app.get('/api/profiles/me', requireAuth, async (req, res) => {
+  try {
+    const profile = req.auth.profile || {};
+    const manualLoc = profile.manualLocation || profile.manual_location || null;
+    res.json({
+      ok: true,
+      data: {
+        user: publicUser(profile),
+        manual_location: manualLoc,
+      },
+    });
+  } catch (error) {
+    return handleError(res, error);
+  }
+});
+
+app.patch('/api/profiles/me/location', requireAuth, async (req, res) => {
+  try {
+    const loc = req.body && (req.body.manual_location || req.body.manualLocation || null);
+    const ref = db.collection('users').doc(req.auth.user.id);
+    await ref.set({
+      manualLocation: loc,
+      manual_location: loc,
+      updatedAt: nowIso(),
+    }, { merge: true });
+    res.json({ ok: true, message: 'Location preference saved.' });
+  } catch (error) {
+    return handleError(res, error);
+  }
 });
 
 app.post('/api/auth/login', authLimiter, async (req, res) => {
@@ -443,7 +597,64 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
   }
 });
 
+app.post('/api/auth/google', authLimiter, async (req, res) => {
+  if (!ENABLE_GOOGLE_SIGNIN) {
+    return res.status(400).json({ ok: false, message: 'Google sign-in is currently disabled.' });
+  }
+  try {
+    const idToken = requireString(req.body.idToken, 'Google ID token');
+    const signIn = await googleIdentityToolkit(idToken);
+    const profile = await ensureUserProfile(signIn.localId, {
+      email: signIn.email,
+      identifier: signIn.email,
+      name: signIn.displayName || (signIn.email ? signIn.email.split('@')[0] : 'Google User'),
+    });
+    res.json({
+      ok: true,
+      message: 'Signed in with Google.',
+      data: { token: signIn.idToken, user: publicUser(profile) },
+    });
+  } catch (error) {
+    return handleError(res, error);
+  }
+});
+
+app.post('/api/auth/signup', authLimiter, async (req, res) => {
+  if (ENABLE_OTP_VERIFY) {
+    return res.status(400).json({ ok: false, message: 'OTP verification is enabled. Use signup start and complete endpoints.' });
+  }
+  try {
+    assertFirebaseServerConfigured();
+    const identifier = normalizeIdentifier(req.body.identifier);
+    if (!isEmail(identifier)) {
+      return res.status(400).json({ ok: false, message: 'Email signup is required.' });
+    }
+    const password = requireString(req.body.password, 'Password');
+
+    const signup = await firebasePasswordRequest('signUp', {
+      email: identifier,
+      password,
+      returnSecureToken: true,
+    });
+    const profile = await ensureUserProfile(signup.localId, {
+      email: signup.email,
+      identifier: signup.email,
+    });
+
+    res.json({
+      ok: true,
+      message: 'Account created.',
+      data: { token: signup.idToken, user: publicUser(profile) },
+    });
+  } catch (error) {
+    return handleError(res, error);
+  }
+});
+
 app.post('/api/auth/signup/start', authLimiter, async (req, res) => {
+  if (!ENABLE_OTP_VERIFY) {
+    return res.status(400).json({ ok: false, message: 'OTP verification is disabled. Use direct signup.' });
+  }
   try {
     assertFirebaseServerConfigured();
     const identifier = normalizeIdentifier(req.body.identifier);
@@ -533,7 +744,31 @@ app.post('/api/auth/logout', requireAuth, (req, res) => {
   res.json({ ok: true, message: 'Logged out.' });
 });
 
-app.get('/api/venues/explore', async (req, res) => {
+// Validate existing session token (if not expired/revoked, serve the profile + token back).
+// Used by clients that have a stored token from previous login.
+app.post('/api/auth/validate', authLimiter, async (req, res) => {
+  try {
+    const token = (req.body && req.body.token) || (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+    if (!token) {
+      return res.status(400).json({ ok: false, message: 'Token required.' });
+    }
+    const decoded = await auth.verifyIdToken(token, true);
+    const profile = await getUserProfile(decoded.uid);
+    res.json({
+      ok: true,
+      message: 'Session valid.',
+      data: {
+        token,
+        user: publicUser(profile),
+        expiresAt: decoded.exp ? new Date(decoded.exp * 1000).toISOString() : null,
+      },
+    });
+  } catch (error) {
+    return res.status(401).json({ ok: false, message: 'Session token expired or invalid. Please sign in again.' });
+  }
+});
+
+app.get('/api/venues/explore', requireAuth, requirePremiumOrAd, async (req, res) => {
   try {
     const venues = filterVenues(await listVenues(), req.query);
     res.json({
@@ -549,7 +784,7 @@ app.get('/api/venues/explore', async (req, res) => {
   }
 });
 
-app.get('/api/venues/search', async (req, res) => {
+app.get('/api/venues/search', requireAuth, requirePremiumOrAd, async (req, res) => {
   try {
     const limit = clampInt(req.query.limit, 8, 1, 50);
     const results = filterVenues(await listVenues(), req.query).slice(0, limit);
@@ -559,7 +794,7 @@ app.get('/api/venues/search', async (req, res) => {
   }
 });
 
-app.get('/api/venues/mine', requireAuth, async (req, res) => {
+app.get('/api/venues/mine', requireAuth, requirePremiumOrAd, async (req, res) => {
   try {
     const snap = await db.collection('venues').where('ownerId', '==', req.auth.user.id).get();
     res.json({ ok: true, message: 'Listings loaded.', listings: snap.docs.map(toListing) });
@@ -570,14 +805,27 @@ app.get('/api/venues/mine', requireAuth, async (req, res) => {
 
 app.get('/api/venues/admin/pending', requireAuth, requireStaff, async (req, res) => {
   try {
-    const snap = await db.collection('venues').where('status', '==', 'pending').get();
-    res.json({ ok: true, message: 'Pending listings loaded.', listings: snap.docs.map(toListing) });
+    // Admin backend fetches pending data from clientbackend (as per architecture:
+    // clients submit only to clientbackend for pending; admin verifies then "pushes"
+    // by status update in shared store, or in future separate project).
+    // This ensures client data for verification is isolated at write time.
+    const clientResp = await fetch('http://localhost:4002/api/venues/admin/pending', {
+      headers: {
+        'Authorization': req.headers.authorization || '',
+        'Content-Type': 'application/json',
+      },
+    });
+    const data = await clientResp.json();
+    if (!clientResp.ok || data.ok === false) {
+      return res.status(502).json({ ok: false, message: data.message || 'Failed to fetch pending from clientbackend.' });
+    }
+    res.json(data);
   } catch (error) {
     return handleError(res, error);
   }
 });
 
-app.get('/api/venues/:venueId/availability', async (req, res) => {
+app.get('/api/venues/:venueId/availability', requireAuth, requirePremiumOrAd, async (req, res) => {
   try {
     assertFirebaseServerConfigured();
     const year = clampInt(req.query.year, new Date().getFullYear(), 2020, 2100);
@@ -603,7 +851,7 @@ app.get('/api/venues/:venueId/availability', async (req, res) => {
   }
 });
 
-app.get('/api/venues/:id', async (req, res) => {
+app.get('/api/venues/:id', requireAuth, requirePremiumOrAd, async (req, res) => {
   try {
     const snap = await db.collection('venues').doc(req.params.id).get();
     if (!snap.exists) return res.status(404).json({ ok: false, message: 'Listing not found.' });
@@ -619,6 +867,9 @@ app.get('/api/venues/:id', async (req, res) => {
 
 app.post('/api/venues', requireAuth, writeLimiter, async (req, res) => {
   try {
+    // Legacy/internal. Normal client submissions go exclusively to clientbackend (pending writes).
+    // Admin fetches pending from clientbackend (see /api/venues/admin/pending proxy), verifies,
+    // then status update here promotes to the main backend store (only admin writes).
     const payload = listingPayload(req.body, req.auth.user, true);
     const ref = await db.collection('venues').add(payload);
     const snap = await ref.get();
@@ -628,7 +879,7 @@ app.post('/api/venues', requireAuth, writeLimiter, async (req, res) => {
   }
 });
 
-app.put('/api/venues/:id', requireAuth, writeLimiter, async (req, res) => {
+app.put('/api/venues/:id', requireAuth, requirePremiumOrAd, writeLimiter, async (req, res) => {
   try {
     const ref = db.collection('venues').doc(req.params.id);
     const snap = await ref.get();
@@ -645,7 +896,7 @@ app.put('/api/venues/:id', requireAuth, writeLimiter, async (req, res) => {
   }
 });
 
-app.delete('/api/venues/:id', requireAuth, async (req, res) => {
+app.delete('/api/venues/:id', requireAuth, requirePremiumOrAd, async (req, res) => {
   try {
     const ref = db.collection('venues').doc(req.params.id);
     const snap = await ref.get();
@@ -688,10 +939,12 @@ function listingPayload(body, user, isCreate) {
     rating: Number(body.rating || 0),
     imageEmoji: String(body.imageEmoji || 'pin'),
     images: Array.isArray(body.images) ? body.images.slice(0, 12).map(String) : [],
+    thumbnails: Array.isArray(body.thumbnails) ? body.thumbnails.slice(0, 12).map(String) : [],
     specTable: body.specTable || { rows: [] },
     status: 'pending',
     verified: false,
     verificationStatus: 'pending_contact',
+    submittedAt: body.submittedAt || undefined,
     updatedAt: nowIso(),
     ...(isCreate ? { ownerId: user.id, ownerName: user.name, createdAt: nowIso() } : {}),
   };
@@ -713,6 +966,10 @@ async function reviewListing(req, res, approve) {
       : { status: 'rejected', verified: false, verificationStatus: 'rejected', rejectionReason: req.body.reason || 'Rejected' };
     await ref.set({ ...update, reviewedBy: req.auth.user.id, updatedAt: nowIso() }, { merge: true });
     const snap = await ref.get();
+    // Per architecture: client submitted full data (incl. CDN URLs, per-space pricing/specs) ONLY to clientbackend.
+    // Admin backend fetched the pending from clientbackend. On approve we update status here (shared store)
+    // so the verified data is now in "backend" (approved for reads by premium/ad users).
+    // Only admin/staff can write approved data this way. Clients cannot modify it.
     res.json({ ok: true, message: approve ? 'Listing approved.' : 'Listing rejected.', listing: toListing(snap) });
   } catch (error) {
     return handleError(res, error);
@@ -748,16 +1005,27 @@ app.get('/api/bookings/mine', requireAuth, async (req, res) => {
     const limit = clampInt(req.query.limit, 12, 1, 50);
     const snap = await db.collection('bookings')
       .where('userId', '==', req.auth.user.id)
-      .orderBy('bookedAt', 'desc')
       .limit(limit)
       .get();
-    res.json({ ok: true, message: 'Bookings loaded.', bookings: snap.docs.map(toBooking) });
+
+    // Sort client-side to avoid needing composite index for where+orderBy in all envs
+    const bookings = snap.docs
+      .map((d) => ({ doc: d, data: toBooking(d) }))
+      .sort((a, b) => {
+        const ta = a.data.bookedAt ? new Date(a.data.bookedAt).getTime() : 0;
+        const tb = b.data.bookedAt ? new Date(b.data.bookedAt).getTime() : 0;
+        return tb - ta;
+      })
+      .slice(0, limit)
+      .map((x) => x.data);
+
+    res.json({ ok: true, message: 'Bookings loaded.', bookings });
   } catch (error) {
     return handleError(res, error);
   }
 });
 
-app.post('/api/bookings', requireAuth, writeLimiter, async (req, res) => {
+app.post('/api/bookings', requireAuth, requirePremiumOrAd, writeLimiter, async (req, res) => {
   try {
     const venueId = requireString(req.body.venueId, 'Venue');
     const eventDate = requireString(req.body.eventDate, 'Event date');
@@ -774,6 +1042,19 @@ app.post('/api/bookings', requireAuth, writeLimiter, async (req, res) => {
       .get();
     if (!duplicate.empty) {
       return res.status(409).json({ ok: false, message: 'This date is already reserved.' });
+    }
+
+    // Restrict more than 5 bookings a day per user (to prevent abuse)
+    const now = new Date();
+    const dayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const dayEnd = new Date(dayStart.getTime() + 24 * 60 * 60 * 1000);
+    const todayCount = await db.collection('bookings')
+      .where('userId', '==', req.auth.user.id)
+      .where('bookedAt', '>=', dayStart.toISOString())
+      .where('bookedAt', '<', dayEnd.toISOString())
+      .get();
+    if (todayCount.size >= 5) {
+      return res.status(429).json({ ok: false, message: 'You cannot create more than 5 bookings per day.' });
     }
 
     const ref = await db.collection('bookings').add({
@@ -858,7 +1139,7 @@ async function getOwnedBooking(bookingId, user) {
   return booking;
 }
 
-app.post('/bookings/:bookingId/pay', requireAuth, async (req, res) => {
+app.post('/bookings/:bookingId/pay', requireAuth, requirePremiumOrAd, async (req, res) => {
   try {
     const booking = await getOwnedBooking(req.params.bookingId, req.auth.user);
     const orderResp = await fetch(`${PAYMENTS_URL}/api/create-order`, {
@@ -876,12 +1157,27 @@ app.post('/bookings/:bookingId/pay', requireAuth, async (req, res) => {
   }
 });
 
-app.post('/api/payments/create-order', requireAuth, async (req, res) => {
-  await proxyPayment(req, res, '/api/create-order');
+app.post('/api/payments/create-order', requireAuth, requirePremiumOrAd, async (req, res) => {
+  const result = await proxyPayment(req, res, '/api/create-order');
+  res.status(result.status).json(result.data);
 });
 
-app.post('/api/payments/verify', requireAuth, async (req, res) => {
-  await proxyPayment(req, res, '/api/verify-payment');
+app.post('/api/payments/verify', requireAuth, requirePremiumOrAd, async (req, res) => {
+  const paymentType = String((req.body && (req.body.type || req.body['type'])) || '').toLowerCase();
+  const result = await proxyPayment(req, res, '/api/verify-payment');
+  if (result.data && result.data.ok === true && (paymentType === 'premium' || paymentType === 'subscription' || paymentType === 'premium_listing')) {
+    try {
+      await db.collection('users').doc(req.auth.user.id).set({
+        isPremium: true,
+        premiumSince: nowIso(),
+        lastPremiumPaymentId: result.data.paymentId || (req.body && req.body.razorpay_payment_id) || null,
+        updatedAt: nowIso(),
+      }, { merge: true });
+    } catch (e) {
+      console.error('Failed to auto-activate premium flag after verify:', e.message);
+    }
+  }
+  res.status(result.status).json(result.data);
 });
 
 async function proxyPayment(req, res, path) {
@@ -892,10 +1188,10 @@ async function proxyPayment(req, res, path) {
       body: JSON.stringify({ ...req.body, userId: req.auth.user.id }),
     });
     const data = await response.json();
-    res.status(response.status).json(data);
+    return { status: response.status, data };
   } catch (error) {
     console.error('Payment proxy failed:', error);
-    res.status(502).json({ ok: false, message: 'Payment service unavailable' });
+    return { status: 502, data: { ok: false, message: 'Payment service unavailable' } };
   }
 }
 
@@ -1030,7 +1326,7 @@ app.put('/api/settings', requireAuth, requireAdmin, async (req, res) => {
   res.json({ ok: true, message: 'Settings updated.', data: { settings } });
 });
 
-app.get('/api/dashboard/client', requireAuth, async (req, res) => {
+app.get('/api/dashboard/client', requireAuth, requirePremiumOrAd, async (req, res) => {
   const bookings = await db.collection('bookings').where('userId', '==', req.auth.user.id).get();
   res.json({
     ok: true,
@@ -1087,6 +1383,78 @@ app.delete('/api/staff/:staffId', requireAuth, requireAdmin, async (req, res) =>
   await db.collection('users').doc(req.params.staffId).set({ role: 'client', disabledAt: nowIso() }, { merge: true });
   await auth.updateUser(req.params.staffId, { disabled: true }).catch(() => {});
   res.json({ ok: true, message: 'Staff member removed.' });
+});
+
+// === Access Control (Premium or Ad-tokenized soft access) ===
+// These enforce that only authenticated + (premium OR recent ad grant) can read protected data.
+// Admin/staff bypass for ops. Writes are owner+access or staff.
+app.get('/api/access/status', requireAuth, async (req, res) => {
+  try {
+    const profile = req.auth.profile || {};
+    const isPremium = profile.isPremium === true || profile.is_premium === true;
+    const adRaw = profile.adAccessUntil || profile.ad_access_until;
+    let adAccessUntil = null;
+    if (adRaw) {
+      const d = typeof adRaw === 'string' ? new Date(adRaw) : (adRaw && adRaw.toDate ? adRaw.toDate() : new Date(adRaw));
+      if (d instanceof Date && !Number.isNaN(d.getTime())) adAccessUntil = d.toISOString();
+    }
+    const role = req.auth.user.role;
+    const hasAccess = isPremium || ['admin', 'manager', 'support', 'reviewer'].includes(role) || (adAccessUntil && new Date(adAccessUntil).getTime() > Date.now());
+    res.json({
+      ok: true,
+      message: hasAccess ? 'Access active.' : 'Access required.',
+      data: {
+        isPremium: !!isPremium,
+        adAccessUntil,
+        hasAccess: !!hasAccess,
+        role,
+      },
+    });
+  } catch (error) {
+    return handleError(res, error);
+  }
+});
+
+app.post('/api/access/grant-ad', requireAuth, writeLimiter, async (req, res) => {
+  try {
+    // 30s ad in frontend succeeded -> grant soft timeout access (default 45 minutes)
+    const TTL_MS = Number(process.env.AD_ACCESS_TTL_MS || 45 * 60 * 1000);
+    const until = new Date(Date.now() + TTL_MS);
+    const ref = db.collection('users').doc(req.auth.user.id);
+    await ref.set({
+      adAccessUntil: until.toISOString(),
+      adAccessGrantedAt: nowIso(),
+      updatedAt: nowIso(),
+    }, { merge: true });
+    const updated = await ref.get();
+    const profile = updated.exists ? updated.data() : {};
+    res.json({
+      ok: true,
+      message: 'Ad access granted. Enjoy 45 minutes of full access.',
+      data: {
+        isPremium: profile.isPremium === true,
+        adAccessUntil: profile.adAccessUntil || until.toISOString(),
+        hasAccess: true,
+      },
+    });
+  } catch (error) {
+    return handleError(res, error);
+  }
+});
+
+// On successful premium payment verify (via proxy), the caller (frontend after verify) can hit this
+// or we auto-upgrade in verify path. This allows explicit refresh too.
+app.post('/api/access/activate-premium', requireAuth, async (req, res) => {
+  try {
+    await db.collection('users').doc(req.auth.user.id).set({
+      isPremium: true,
+      premiumSince: nowIso(),
+      updatedAt: nowIso(),
+    }, { merge: true });
+    res.json({ ok: true, message: 'Premium activated.', data: { isPremium: true, hasAccess: true } });
+  } catch (error) {
+    return handleError(res, error);
+  }
 });
 
 app.use((req, res) => {
