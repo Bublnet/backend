@@ -7,9 +7,11 @@
   "scripts": {
     "start": "node index.js",
     "dev": "nodemon index.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node --test",
+    "admin:hash-password": "node scripts/hash-admin-password.js"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.45.1",
     "cors": "^2.8.6",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",

@@ -2,7 +2,23 @@
 
 Node.js / Express backend for the Dvenue Flutter app.
 
-The Flutter client should talk only to this backend. The backend verifies Firebase ID tokens, owns Firestore writes, proxies payments, and enforces role/ownership checks for listings, booking enquiries, staff, and admin actions.
+The Flutter client uses Supabase Auth directly and sends its Supabase access
+token to this backend. The backend verifies that token with Supabase, reads the
+protected `profiles` row, and enforces role, parent-account, venue ownership,
+booking, and staff-management boundaries. Firebase remains only as a legacy
+operational datastore for approved venue mirrors and bookings.
+
+Roles:
+
+- `admin`: full platform access; creates elevated `staff` accounts.
+- `staff`: elevated admin operations, excluding staff creation and app settings.
+- `host`: owns venues and creates scoped `hoststaff` accounts.
+- `hoststaff`: operates its parent host's bookings, rates, discounts, and calendar.
+- `client`: customer discovery and booking access.
+
+The role is read only from `public.profiles`; user metadata and request bodies
+cannot elevate privileges. Apply `clientbackend/supabase-schema.sql` before
+starting the services.
 
 ## Setup
 
@@ -58,6 +74,33 @@ Never commit `.env`, service account JSON files, or private keys.
 - Protected routes require `Authorization: Bearer <Firebase ID token>`.
 - The backend verifies tokens with Firebase Admin and reads the user role from `users/{uid}`.
 - `DEFAULT_ADMIN_EMAIL` promotes the matching first profile to `admin`.
+
+### Dedicated admin portal login
+
+The main backend also supports an environment-defined administrator. Configure
+`ADMIN_LOGIN_IDENTIFIER` and either `ADMIN_LOGIN_PASSWORD_HASH` (preferred) or
+`ADMIN_LOGIN_PASSWORD`. Generate a scrypt password hash with:
+
+```bash
+npm run admin:hash-password -- "a-long-unique-password"
+```
+
+Successful login through `POST /api/auth/login` returns a random, opaque token
+with an `asdf_` prefix. Only the SHA-256 hash of that token is stored in
+Firestore (`adminSessions`), and sessions expire after
+`ADMIN_SESSION_TTL_MINUTES` (8 hours by default). Logout revokes the session.
+
+The token works as a standard bearer credential and in the requested URL form:
+
+```text
+/api/<asdf-token>/admin/listings
+/api/<asdf-token>/settings
+```
+
+Bearer headers are safer because URL tokens may be retained by browser history,
+proxies, and hosting logs. The API marks authenticated responses `no-store` and
+sets a `no-referrer` policy, but production logging should also redact paths
+containing `asdf_` tokens.
 
 ## Main Routes
 
