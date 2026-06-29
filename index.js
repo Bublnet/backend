@@ -12,6 +12,7 @@ import {
   normalizeRole,
   supabaseAdmin,
 } from './supabase.client.js';
+import { removeListing } from './remove_listing.js';
 import helmet from 'helmet';
 import fetch from 'node-fetch';
 import { fileURLToPath } from 'url';
@@ -93,6 +94,27 @@ function sanitizeSpecTable(raw) {
         )
       : [["Area", ""], ["Parking", ""]]
   };
+}
+
+async function captureBookingPayment(bookingId) {
+  try {
+    const res = await fetch(`${PAYMENTS_URL}/api/capture-payment`, {
+      method: 'POST',
+      headers: { 
+        'Content-Type': 'application/json',
+        ...(process.env.INTERNAL_SERVICE_TOKEN && { 'X-Internal-Service-Token': process.env.INTERNAL_SERVICE_TOKEN })
+      },
+      body: JSON.stringify({ referenceId: bookingId }),
+    });
+    const result = await res.json();
+    if (!res.ok || !result.ok) {
+      console.warn(`[PAYMENTS CAPTURE WARNING] Booking ${bookingId}:`, result.message);
+    } else {
+      console.log(`[PAYMENTS CAPTURE SUCCESS] Booking ${bookingId} captured successfully.`);
+    }
+  } catch (err) {
+    console.error(`[PAYMENTS CAPTURE ERROR] Failed to capture booking ${bookingId}:`, err);
+  }
 }
 const DEFAULT_ADMIN_EMAIL = process.env.DEFAULT_ADMIN_EMAIL;
 const ADMIN_LOGIN_IDENTIFIER = process.env.ADMIN_LOGIN_IDENTIFIER;
@@ -404,6 +426,27 @@ const requireHost = requireRole(['host']);
 const requireHostOperator = requireRole(['host', 'hoststaff']);
 const requireBookingOperator = requireRole(['admin', 'staff', 'host', 'hoststaff']);
 
+async function insertActivityLog({
+  actorId, actorName, actorRole,
+  action, targetType, targetId, targetName,
+  details = {},
+}) {
+  if (!supabaseAdmin) return;
+  try {
+    await supabaseAdmin.from('activity_logs').insert({
+      actor_id: actorId,
+      actor_name: actorName || '',
+      actor_role: actorRole || '',
+      action,
+      target_type: targetType || '',
+      target_id: targetId || null,
+      target_name: targetName || null,
+      details,
+      created_at: nowIso(),
+    });
+  } catch (_) {}
+}
+
 function operationalOwnerId(req) {
   return req.auth.user.role === 'hoststaff'
     ? req.auth.user.parentId
@@ -519,6 +562,8 @@ function toListing(doc) {
     pincode: data.pincode || '',
     state: data.state || '',
     country: data.country || 'India',
+    phone: data.phone || '',
+    altPhone: data.altPhone || '',
     lat: Number(data.lat || 0),
     lng: Number(data.lng || 0),
     capacity: data.capacity ?? null,
@@ -703,12 +748,20 @@ app.get('/health', async (req, res) => {
   });
 });
 
-app.get('/api/config/public', (req, res) => {
+app.get('/api/config/public', async (req, res) => {
+  const discSnap = await db.collection('settings').doc('discounts').get();
+  const discountRules = discSnap.exists && discSnap.data().rules ? discSnap.data().rules : [
+    { maxDays: 1, percent: 60 },
+    { maxDays: 6, percent: 45 },
+    { maxDays: 13, percent: 30 }
+  ];
+
   res.json({
     ok: true,
     razorpayKeyId: process.env.RAZORPAY_KEY_ID || null,
     enableOtpVerify: ENABLE_OTP_VERIFY,
     enableGoogleSignin: ENABLE_GOOGLE_SIGNIN,
+    discountRules,
   });
 });
 
@@ -947,32 +1000,13 @@ app.post('/api/auth/validate', authLimiter, async (req, res) => {
 });
 
 app.get('/api/venues/explore', requireAuth, async (req, res) => {
-  try {
-    const venues = filterVenues(await listVenues(), req.query)
-      .map((listing) => venueForViewer(listing, req));
-    res.json({
-      ok: true,
-      message: 'Venues loaded.',
-      region: 'Your Region',
-      venues: venues.slice(0, 6),
-      nearby: venues,
-      all: venues,
-    });
-  } catch (error) {
-    return handleError(res, error);
-  }
+  const result = await proxyClientData(req);
+  res.status(result.status).json(result.data);
 });
 
 app.get('/api/venues/search', requireAuth, async (req, res) => {
-  try {
-    const limit = clampInt(req.query.limit, 8, 1, 50);
-    const results = filterVenues(await listVenues(), req.query)
-      .slice(0, limit)
-      .map((listing) => venueForViewer(listing, req));
-    res.json({ ok: true, message: 'Search complete.', results });
-  } catch (error) {
-    return handleError(res, error);
-  }
+  const result = await proxyClientData(req);
+  res.status(result.status).json(result.data);
 });
 
 app.get('/api/venues/mine', requireAuth, async (req, res) => {
@@ -1162,10 +1196,15 @@ app.get('/api/venues/:venueId/availability', async (req, res) => {
     
     snap.docs.forEach((doc) => {
       const booking = toBooking(doc);
-      if (['pending', 'confirmed'].includes(booking.status) && booking.eventDate.startsWith(prefix)) {
-        booked.add(booking.eventDate);
-        if (uid && booking.userId === uid) {
-          bookedByMe.add(booking.eventDate);
+      if (['pending', 'confirmed'].includes(booking.status)) {
+        const dates = booking.eventDate.split('; ');
+        for (const d of dates) {
+          if (d.startsWith(prefix)) {
+            booked.add(d);
+            if (uid && booking.userId === uid) {
+              bookedByMe.add(d);
+            }
+          }
         }
       }
     });
@@ -1182,6 +1221,13 @@ app.get('/api/venues/:venueId/availability', async (req, res) => {
     const daysInMonth = new Date(year, month, 0).getDate();
     const today = new Date();
     const todayKey = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
+    const discSnap = await db.collection('settings').doc('discounts').get();
+    const discountRules = discSnap.exists && discSnap.data().rules ? discSnap.data().rules : [
+      { maxDays: 1, percent: 60 },
+      { maxDays: 6, percent: 45 },
+      { maxDays: 13, percent: 30 }
+    ];
+
     const days = Array.from({ length: daysInMonth }, (_, i) => {
       const date = `${prefix}-${String(i + 1).padStart(2, '0')}`;
       const override = overrides[date] || {};
@@ -1193,7 +1239,21 @@ app.get('/api/venues/:venueId/availability', async (req, res) => {
       const isPast = date < todayKey;
       const isFullyBooked = booked.has(date) || isFullyBookedByHost;
 
-      const discountPercent = Math.max(0, Math.min(100, Number(override.discountPercent || 0)));
+      const baseDiscountPercent = Math.max(0, Math.min(100, Number(override.discountPercent || 0)));
+      
+      const eventDay = new Date(date);
+      const todayDate = new Date(); todayDate.setHours(0, 0, 0, 0);
+      const diffDays = Math.round((eventDay - todayDate) / (1000 * 60 * 60 * 24));
+      
+      let autoDiscountPercent = 0;
+      const sortedRules = [...discountRules].sort((a, b) => a.maxDays - b.maxDays);
+      for (const rule of sortedRules) {
+        if (diffDays <= rule.maxDays) {
+          autoDiscountPercent = rule.percent;
+          break;
+        }
+      }
+      const discountPercent = Math.max(baseDiscountPercent, autoDiscountPercent);
       const applyDiscount = (val) => val ? Math.round(val * (1 - discountPercent / 100)) : null;
       
       const rate = applyDiscount(originalRate);
@@ -1225,24 +1285,15 @@ app.get('/api/venues/:venueId/availability', async (req, res) => {
         discountPercent,
       };
     });
-    res.json({ ok: true, venueId: req.params.venueId, year, month, days });
+    res.json({ ok: true, venueId: req.params.venueId, year, month, days, bookedSlots: Array.from(booked) });
   } catch (error) {
     return handleError(res, error);
   }
 });
 
 app.get('/api/venues/:id', requireAuth, async (req, res) => {
-  try {
-    const snap = await db.collection('venues').doc(req.params.id).get();
-    if (!snap.exists) return res.status(404).json({ ok: false, message: 'Listing not found.' });
-    const listing = toListing(snap);
-    if (listing.status !== 'approved') {
-      return res.status(404).json({ ok: false, message: 'Listing not found.' });
-    }
-    return res.json({ ok: true, listing: venueForViewer(listing, req) });
-  } catch (error) {
-    return handleError(res, error);
-  }
+  const result = await proxyClientData(req);
+  res.status(result.status).json(result.data);
 });
 
 app.post('/api/venues', requireAuth, writeLimiter, async (req, res) => {
@@ -1313,6 +1364,8 @@ function listingPayload(body, user, isCreate) {
     location: String(body.location || '').trim(),
     address: requireString(body.address, 'Address'),
     pincode: String(body.pincode || '').trim(),
+    phone: String(body.phone || '').trim(),
+    altPhone: String(body.altPhone || '').trim(),
     state: String(body.state || '').trim(),
     country: String(body.country || 'India').trim(),
     lat: Number(body.lat || 0),
@@ -1375,16 +1428,15 @@ async function reviewListing(req, res, approve) {
     };
     const existingSnap = await db.collection('venues').doc(req.params.id).get();
     const previousListing = existingSnap.exists ? toListing(existingSnap) : null;
-    const firestoreListing = cleanForFirestore(finalListing);
+    const { reviewedBy: _, ...writePayload } = cleanForFirestore(finalListing);
     await writeVenueWithHistory({
       venueId: req.params.id,
       before: previousListing,
-      after: firestoreListing,
+      after: writePayload,
       actor: req.auth.user,
       source: approve ? 'admin_approval' : 'admin_rejection',
     });
-    await syncVenueToPayments(firestoreListing);
-
+    await syncVenueToPayments(writePayload);
     res.json({ ok: true, message: approve ? 'Listing approved.' : 'Listing rejected.', listing: finalListing });
   } catch (error) {
     return handleError(res, error);
@@ -1397,6 +1449,15 @@ app.post('/api/admin/listings/:id/mark-contacted', requireAuth, requireStaff, as
 
 app.post('/api/admin/listings/:id/verify-details', requireAuth, requireStaff, async (req, res) => {
   await updateListingVerification(req, res, 'details_verified', 'Business details verified.');
+});
+
+app.delete('/api/admin/listings/:id', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    await removeListing(req.params.id);
+    res.json({ ok: true, message: 'Listing and associated data removed.' });
+  } catch (error) {
+    return handleError(res, error);
+  }
 });
 
 app.get('/api/admin/listings/:id/price-history', requireAuth, requireStaff, async (req, res) => {
@@ -1473,13 +1534,12 @@ async function syncVenueToPayments(listing) {
 
 app.get('/api/bookings/mine', requireAuth, async (req, res) => {
   try {
-    const limit = clampInt(req.query.limit, 12, 1, 50);
+    const limit = clampInt(req.query.limit, 50, 1, 100);
     const snap = await db.collection('bookings')
       .where('userId', '==', req.auth.user.id)
       .limit(limit)
       .get();
 
-    // Sort client-side to avoid needing composite index for where+orderBy in all envs
     const bookings = snap.docs
       .map((d) => ({ doc: d, data: toBooking(d) }))
       .sort((a, b) => {
@@ -1490,11 +1550,79 @@ app.get('/api/bookings/mine', requireAuth, async (req, res) => {
       .slice(0, limit)
       .map((x) => x.data);
 
+    if (supabaseAdmin && bookings.length > 0) {
+      const ids = bookings.map(b => b.id);
+      const { data: payments } = await supabaseAdmin.from('payments').select('reference_id, razorpay_payment_id, razorpay_order_id, amount_paise').in('reference_id', ids).eq('status', 'paid');
+      if (payments) {
+        for (const b of bookings) {
+          const p = payments.find(p => p.reference_id === b.id);
+          if (p) {
+            b.paymentId = p.razorpay_payment_id;
+            b.razorpayOrderId = p.razorpay_order_id;
+            if (p.amount_paise) b.amountPaid = p.amount_paise / 100;
+          }
+        }
+      }
+    }
+
+    console.log(`[BOOKINGS/MINE] userId=${req.auth.user.id} found=${bookings.length}`);
     res.json({ ok: true, message: 'Bookings loaded.', bookings });
   } catch (error) {
     return handleError(res, error);
   }
 });
+
+// Received bookings: for venue hosts and admins — bookings placed AT their venues.
+// Admin gets all bookings; hosts get bookings where ownerId matches their userId or parentId.
+app.get('/api/bookings/received', requireAuth, async (req, res) => {
+  try {
+    const limit = clampInt(req.query.limit, 50, 1, 100);
+    const user = req.auth.user;
+    const isAdmin = user.role === 'admin' || user.role === 'staff';
+    const hostId = user.parentId || user.id; // host or hoststaff's parent host
+
+    let snap;
+    if (isAdmin) {
+      snap = await db.collection('bookings').limit(limit).get();
+    } else {
+      snap = await db.collection('bookings')
+        .where('ownerId', '==', hostId)
+        .limit(limit)
+        .get();
+    }
+
+    const bookings = snap.docs
+      .map((d) => ({ doc: d, data: toBooking(d) }))
+      .sort((a, b) => {
+        const ta = a.data.bookedAt ? new Date(a.data.bookedAt).getTime() : 0;
+        const tb = b.data.bookedAt ? new Date(b.data.bookedAt).getTime() : 0;
+        return tb - ta;
+      })
+      .slice(0, limit)
+      .map((x) => x.data);
+
+    if (supabaseAdmin && bookings.length > 0) {
+      const ids = bookings.map(b => b.id);
+      const { data: payments } = await supabaseAdmin.from('payments').select('reference_id, razorpay_payment_id, razorpay_order_id, amount_paise').in('reference_id', ids).eq('status', 'paid');
+      if (payments) {
+        for (const b of bookings) {
+          const p = payments.find(p => p.reference_id === b.id);
+          if (p) {
+            b.paymentId = p.razorpay_payment_id;
+            b.razorpayOrderId = p.razorpay_order_id;
+            if (p.amount_paise) b.amountPaid = p.amount_paise / 100;
+          }
+        }
+      }
+    }
+
+    console.log(`[BOOKINGS/RECEIVED] userId=${user.id} role=${user.role} found=${bookings.length}`);
+    res.json({ ok: true, message: 'Received bookings loaded.', bookings });
+  } catch (error) {
+    return handleError(res, error);
+  }
+});
+
 
 app.post('/api/bookings', requireAuth, writeLimiter, async (req, res) => {
   try {
@@ -1519,30 +1647,67 @@ app.post('/api/bookings', requireAuth, writeLimiter, async (req, res) => {
     }
 
     // Parse eventDate string like "YYYY-MM-DD|day" or "YYYY-MM-DD|night" or "YYYY-MM-DD|00:00-00:59|Main Space"
-    const [dateString, slotString, spaceName] = eventDateRaw.split('|');
-    const primarySpace = (spaceName ? venue.spaces?.find(s => s.name === spaceName) : venue.spaces?.[0]) || venue.spaces?.[0] || {};
-    const overrides = primarySpace.calendarOverrides || {};
-    const override = overrides[dateString] || {};
-    const discountPercent = Math.max(0, Math.min(100, Number(override.discountPercent || 0)));
+    // Handle multiple dates joined by "; "
+    const dates = eventDateRaw.split('; ');
+    let totalServerFinalAmount = 0;
     
-    let baseAmount = venue.priceWithGst || venue.basePrice || 0;
-    if (slotString === 'day' && primarySpace.dayPrice) {
-      baseAmount = Number(primarySpace.dayPrice);
-    } else if (slotString === 'night' && primarySpace.nightPrice) {
-      baseAmount = Number(primarySpace.nightPrice);
-    } else if (slotString && primarySpace.hourlyPrices && primarySpace.hourlyPrices[slotString]) {
-      baseAmount = Number(primarySpace.hourlyPrices[slotString]);
-    } else if (slotString && slotString.startsWith('hour_') && primarySpace.hourlyPrices) {
-      const hourKey = slotString.replace('hour_', '');
-      if (primarySpace.hourlyPrices[hourKey]) {
-        baseAmount = Number(primarySpace.hourlyPrices[hourKey]);
+    // Auto-discount: use dynamic global rules
+    const discSnap = await db.collection('settings').doc('discounts').get();
+    const discountRules = discSnap.exists && discSnap.data().rules ? discSnap.data().rules : [
+      { maxDays: 1, percent: 60 },
+      { maxDays: 6, percent: 45 },
+      { maxDays: 13, percent: 30 }
+    ];
+
+    for (const d of dates) {
+      const [dateString, slotString, spaceName] = d.split('|');
+      const primarySpace = (spaceName ? venue.spaces?.find(s => s.name === spaceName) : venue.spaces?.[0]) || venue.spaces?.[0] || {};
+      const overrides = primarySpace.calendarOverrides || {};
+      const override = overrides[dateString] || {};
+      const baseDiscountPercent = Math.max(0, Math.min(100, Number(override.discountPercent || 0)));
+
+      const eventDay = new Date(dateString);
+      const todayDate = new Date(); todayDate.setHours(0, 0, 0, 0);
+      const diffDays = Math.round((eventDay - todayDate) / (1000 * 60 * 60 * 24));
+      
+      let autoDiscountPercent = 0;
+      const sortedRules = [...discountRules].sort((a, b) => a.maxDays - b.maxDays);
+      for (const rule of sortedRules) {
+        if (diffDays <= rule.maxDays) {
+          autoDiscountPercent = rule.percent;
+          break;
+        }
       }
-    } else if (primarySpace.dayPrice || primarySpace.nightPrice) {
-      // If it's a split cell but they somehow booked the whole day, just use priceWithGst
-      baseAmount = venue.priceWithGst || venue.basePrice || 0;
+      const discountPercent = Math.max(baseDiscountPercent, autoDiscountPercent);
+
+      let baseAmount = venue.priceWithGst || venue.basePrice || 0;
+      if (slotString === 'day' && primarySpace.dayPrice) {
+        baseAmount = Number(primarySpace.dayPrice);
+      } else if (slotString === 'night' && primarySpace.nightPrice) {
+        baseAmount = Number(primarySpace.nightPrice);
+      } else if (slotString && primarySpace.hourlyPrices && primarySpace.hourlyPrices[slotString]) {
+        baseAmount = Number(primarySpace.hourlyPrices[slotString]);
+      } else if (slotString && slotString.startsWith('hour_') && primarySpace.hourlyPrices) {
+        const hourKey = slotString.replace('hour_', '');
+        if (primarySpace.hourlyPrices[hourKey]) {
+          baseAmount = Number(primarySpace.hourlyPrices[hourKey]);
+        }
+      } else if (primarySpace.dayPrice || primarySpace.nightPrice) {
+        baseAmount = venue.priceWithGst || venue.basePrice || 0;
+      }
+      
+      totalServerFinalAmount += Math.round(baseAmount * (1 - discountPercent / 100));
     }
 
-    const finalAmount = Math.round(baseAmount * (1 - discountPercent / 100));
+    // If the client sent an amount (their computed discounted total), trust it only
+    // when it's lower than our server-computed value (plus 1 rupee for rounding variance)
+    const clientAmount = req.body.amount != null ? Number(req.body.amount) : null;
+    const serverFinalAmount = totalServerFinalAmount;
+    const finalAmount = (clientAmount != null && clientAmount > 0 && clientAmount <= serverFinalAmount + 1)
+      ? Math.round(clientAmount)
+      : serverFinalAmount;
+
+    console.log(`[BOOKING CREATE] venueId=${venueId} eventDate=${eventDateRaw} serverFinal=${serverFinalAmount} clientSent=${clientAmount} -> finalAmount=${finalAmount}`);
 
     const duplicate = await db.collection('bookings')
       .where('venueId', '==', venueId)
@@ -1558,6 +1723,22 @@ app.post('/api/bookings', requireAuth, writeLimiter, async (req, res) => {
           await db.collection('bookings').doc(dup.id).set({ amount: finalAmount }, { merge: true });
           dupData.amount = finalAmount;
         }
+        // Sync resuming booking to Supabase so payments service can read it
+        if (supabaseAdmin) {
+          await supabaseAdmin.from('bookings').upsert({
+            id: dup.id,
+            venueId: dupData.venueId,
+            venueName: dupData.venueName,
+            userId: dupData.userId,
+            customerName: dupData.customerName,
+            amount: dupData.amount,
+            status: dupData.status,
+            paymentStatus: dupData.paymentStatus,
+            eventDate: dupData.eventDate,
+            bookedAt: dupData.bookedAt,
+          }, { onConflict: 'id' });
+          console.log(`[BOOKING SUPABASE SYNC] Upserted resuming booking ${dup.id} amount=${dupData.amount}`);
+        }
         return res.status(200).json({ 
           ok: true, 
           message: 'Resuming existing booking for payment.', 
@@ -1567,7 +1748,7 @@ app.post('/api/bookings', requireAuth, writeLimiter, async (req, res) => {
       return res.status(409).json({ ok: false, message: 'This date/slot is already reserved.' });
     }
 
-    const ref = await db.collection('bookings').add({
+    const bookingData = {
       venueId,
       venueName: venue.name,
       customerName: req.auth.user.name,
@@ -1582,12 +1763,40 @@ app.post('/api/bookings', requireAuth, writeLimiter, async (req, res) => {
       paymentStatus: 'unpaid',
       bookedAt: nowIso(),
       eventDate: eventDateRaw,
-    });
+      ticketCode: (venue.name.replace(/[^A-Za-z]/g, '').substring(0, 4).toUpperCase().padEnd(4, 'X')) + Math.floor(10000 + Math.random() * 90000).toString(),
+    };
+
+    console.log(`[BOOKING CREATE] Writing to Firestore:`, JSON.stringify(bookingData));
+    const ref = await db.collection('bookings').add(bookingData);
     const snap = await ref.get();
+    const booking = toBooking(snap);
+
+    // Also write to Supabase so the payments service can look it up by id
+    if (supabaseAdmin) {
+      const { error: sbError } = await supabaseAdmin.from('bookings').upsert({
+        id: booking.id,
+        venueId,
+        venueName: venue.name,
+        userId: req.auth.user.id,
+        customerName: req.auth.user.name,
+        amount: finalAmount,
+        status: 'pending',
+        paymentStatus: 'unpaid',
+        eventDate: eventDateRaw,
+        bookedAt: booking.bookedAt,
+      }, { onConflict: 'id' });
+      if (sbError) {
+        console.error(`[BOOKING SUPABASE SYNC ERROR] Failed to upsert booking ${booking.id}:`, sbError);
+      } else {
+        console.log(`[BOOKING SUPABASE SYNC] Upserted booking ${booking.id} with amount=${finalAmount} to Supabase successfully`);
+      }
+    }
+
+    console.log(`[BOOKING CREATE] Response booking:`, JSON.stringify(booking));
     res.status(201).json({
       ok: true,
       message: 'Booking enquiry created. Complete payment to reserve your date.',
-      booking: toBooking(snap),
+      booking,
     });
   } catch (error) {
     return handleError(res, error);
@@ -1673,16 +1882,33 @@ app.post('/api/payments/create-order', requireAuth, async (req, res) => {
 app.post('/api/payments/verify', requireAuth, async (req, res) => {
   const paymentType = String((req.body && (req.body.type || req.body['type'])) || '').toLowerCase();
   const result = await proxyPayment(req, res, '/api/verify-payment');
-  if (result.data && result.data.ok === true && (paymentType === 'premium' || paymentType === 'subscription' || paymentType === 'premium_listing')) {
-    try {
-      await supabaseAdmin.from('profiles').update({
-        is_premium: true,
-        premium_since: nowIso(),
-        last_payment_id: result.data.paymentId || (req.body && req.body.razorpay_payment_id) || null,
-        updated_at: nowIso(),
-      }).eq('id', req.auth.user.id);
-    } catch (e) {
-      console.error('Failed to auto-activate premium flag after verify:', e.message);
+  if (result.data && result.data.ok === true) {
+    if (paymentType === 'premium' || paymentType === 'subscription' || paymentType === 'premium_listing') {
+      try {
+        await supabaseAdmin.from('profiles').update({
+          is_premium: true,
+          premium_since: nowIso(),
+          last_payment_id: result.data.paymentId || (req.body && req.body.razorpay_payment_id) || null,
+          updated_at: nowIso(),
+        }).eq('id', req.auth.user.id);
+      } catch (e) {
+        console.error('Failed to auto-activate premium flag after verify:', e.message);
+      }
+    } else if (paymentType === 'booking') {
+      const bookingId = req.body.id || req.body.bookingId;
+      if (bookingId) {
+        try {
+          const updateData = {
+            paymentStatus: 'paid',
+            status: 'pending',
+            paidAt: nowIso(),
+          };
+          console.log(`[PAYMENTS VERIFY] Syncing booking ${bookingId} to Firestore:`, updateData);
+          await db.collection('bookings').doc(bookingId).set(updateData, { merge: true });
+        } catch (e) {
+          console.error(`[PAYMENTS VERIFY] Failed to sync booking ${bookingId} to Firestore:`, e);
+        }
+      }
     }
   }
   res.status(result.status).json(result.data);
@@ -1851,6 +2077,10 @@ app.post('/api/admin/bookings/:bookingId/confirm', requireAuth, requireBookingOp
       confirmedAt: nowIso(),
       updatedAt: nowIso(),
     }, { merge: true });
+    
+    // Attempt to capture payment since booking is approved
+    captureBookingPayment(req.params.bookingId);
+
     const snap = await ref.get();
     res.json({ ok: true, message: 'Booking confirmed. Ticket generated.', booking: toBooking(snap) });
   } catch (error) {
@@ -1866,6 +2096,10 @@ app.post('/api/admin/bookings/:bookingId/ticket', requireAuth, requireBookingOpe
       return res.status(404).json({ ok: false, message: 'Booking not found.' });
     }
     await ref.set({ ticketImage: req.body.ticketImage || null, status: 'confirmed', confirmedAt: nowIso() }, { merge: true });
+    
+    // Attempt to capture payment since booking is approved
+    captureBookingPayment(req.params.bookingId);
+
     const snap = await ref.get();
     res.json({ ok: true, message: 'Ticket uploaded and booking approved.', booking: toBooking(snap) });
   } catch (error) {
@@ -1875,7 +2109,15 @@ app.post('/api/admin/bookings/:bookingId/ticket', requireAuth, requireBookingOpe
 
 app.get('/api/settings', requireAuth, requireAdmin, async (req, res) => {
   const snap = await db.collection('settings').doc('app').get();
-  res.json({ ok: true, message: 'Settings loaded.', data: { settings: snap.exists ? snap.data() : {} } });
+  const discSnap = await db.collection('settings').doc('discounts').get();
+  res.json({ 
+    ok: true, 
+    message: 'Settings loaded.', 
+    data: { 
+      settings: snap.exists ? snap.data() : {},
+      discounts: discSnap.exists ? discSnap.data().rules : [],
+    } 
+  });
 });
 
 app.put('/api/settings', requireAuth, requireAdmin, async (req, res) => {
@@ -1886,6 +2128,12 @@ app.put('/api/settings', requireAuth, requireAdmin, async (req, res) => {
   };
   await db.collection('settings').doc('app').set(settings, { merge: true });
   res.json({ ok: true, message: 'Settings updated.', data: { settings } });
+});
+
+app.put('/api/settings/discounts', requireAuth, requireAdmin, async (req, res) => {
+  const rules = req.body.rules || [];
+  await db.collection('settings').doc('discounts').set({ rules, updatedAt: nowIso() }, { merge: true });
+  res.json({ ok: true, message: 'Discount rules updated.', data: { rules } });
 });
 
 app.get('/api/dashboard/client', requireAuth, requirePremiumOrAd, async (req, res) => {
@@ -1937,21 +2185,26 @@ app.get('/api/staff', requireAuth, requireStaffManager, async (req, res) => {
 app.post('/api/staff', requireAuth, requireStaffManager, async (req, res) => {
   try {
     const identifier = normalizeIdentifier(req.body.identifier);
-    const password = requireString(req.body.password, 'Password');
     const name = requireString(req.body.name, 'Name');
     const role = req.auth.user.role === 'admin' ? 'staff' : 'hoststaff';
     const permissions = role === 'staff'
       ? { elevated: true }
       : { bookings: true, pricing: true, calendar: true, listings: false, staff: false };
-    const { data: created, error: createError } = await supabaseAdmin.auth.admin.createUser({
-      email: identifier,
-      password,
-      email_confirm: true,
-      user_metadata: { name },
-    });
-    if (createError) throw createError;
-    const profile = {
-      id: created.user.id,
+
+    const { data: existingUsers, error: lookupError } = await supabaseAdmin.auth.admin.listUsers();
+    if (lookupError) throw lookupError;
+    const existingUser = (existingUsers?.users || []).find(
+      (u) => u.email && normalizeIdentifier(u.email) === identifier
+    );
+    if (!existingUser) {
+      return res.status(404).json({
+        ok: false,
+        message: 'No user found with that email. Ask them to sign up first.',
+      });
+    }
+
+    const { error: profileError } = await supabaseAdmin.from('profiles').upsert({
+      id: existingUser.id,
       email: identifier,
       display_name: name,
       role,
@@ -1959,13 +2212,24 @@ app.post('/api/staff', requireAuth, requireStaffManager, async (req, res) => {
       permissions,
       active: true,
       updated_at: nowIso(),
-    };
-    const { error: profileError } = await supabaseAdmin.from('profiles').upsert(profile);
+    });
     if (profileError) throw profileError;
+
+    await insertActivityLog({
+      actorId: req.auth.user.id,
+      actorName: req.auth.user.name,
+      actorRole: req.auth.user.role,
+      action: 'staff.add',
+      targetType: 'user',
+      targetId: existingUser.id,
+      targetName: name,
+      details: { identifier, role },
+    });
+
     res.status(201).json({
       ok: true,
       message: role === 'staff' ? 'Admin staff member added.' : 'Host staff member added.',
-      data: { staff: publicUser({ ...profile, name, identifier }) },
+      data: { staff: publicUser({ id: existingUser.id, name, identifier, role, parent_id: req.auth.user.id, permissions }) },
     });
   } catch (error) {
     return handleError(res, error);
@@ -1986,6 +2250,18 @@ app.put('/api/staff/:staffId/role', requireAuth, requireStaffManager, async (req
     .update({ role: expectedRole, permissions, updated_at: nowIso() })
     .eq('id', req.params.staffId).select().single();
   if (error) return handleError(res, error);
+
+  await insertActivityLog({
+    actorId: req.auth.user.id,
+    actorName: req.auth.user.name,
+    actorRole: req.auth.user.role,
+    action: 'staff.update',
+    targetType: 'user',
+    targetId: req.params.staffId,
+    targetName: profile.display_name,
+    details: { permissions },
+  });
+
   res.json({
     ok: true,
     message: 'Staff permissions updated.',
@@ -1997,10 +2273,22 @@ app.delete('/api/staff/:staffId', requireAuth, requireStaffManager, async (req, 
   const { data: existing } = await supabaseAdmin.from('profiles').select('id')
     .eq('id', req.params.staffId).eq('parent_id', req.auth.user.id).maybeSingle();
   if (!existing) return res.status(404).json({ ok: false, message: 'Staff member not found.' });
-  const { error } = await supabaseAdmin.from('profiles')
-    .update({ active: false, updated_at: nowIso() }).eq('id', req.params.staffId);
-  if (error) return handleError(res, error);
+  const { data: removedProfile } = await supabaseAdmin.from('profiles')
+    .update({ active: false, updated_at: nowIso() }).eq('id', req.params.staffId).select('display_name,email').single();
+  if (!removedProfile) return res.status(404).json({ ok: false, message: 'Staff member not found.' });
   await supabaseAdmin.auth.admin.updateUserById(req.params.staffId, { ban_duration: '876000h' });
+
+  await insertActivityLog({
+    actorId: req.auth.user.id,
+    actorName: req.auth.user.name,
+    actorRole: req.auth.user.role,
+    action: 'staff.remove',
+    targetType: 'user',
+    targetId: req.params.staffId,
+    targetName: removedProfile.display_name,
+    details: { email: removedProfile.email },
+  });
+
   res.json({ ok: true, message: 'Staff member removed.' });
 });
 
@@ -2013,6 +2301,18 @@ app.put('/api/admin/users/:userId/role', requireAuth, requireAdmin, async (req, 
     .update({ role, parent_id: null, permissions: {}, updated_at: nowIso() })
     .eq('id', req.params.userId).select().single();
   if (error) return handleError(res, error);
+
+  await insertActivityLog({
+    actorId: req.auth.user.id,
+    actorName: req.auth.user.name,
+    actorRole: req.auth.user.role,
+    action: 'user.role.change',
+    targetType: 'user',
+    targetId: req.params.userId,
+    targetName: profile.display_name,
+    details: { newRole: role, email: profile.email },
+  });
+
   res.json({ ok: true, message: `User role changed to ${role}.`, data: { user: publicUser(profile) } });
 });
 
@@ -2081,6 +2381,103 @@ app.post('/api/access/activate-premium', requireAuth, async (req, res) => {
     }).eq('id', req.auth.user.id);
     if (error) throw error;
     res.json({ ok: true, message: 'Premium activated.', data: { isPremium: true, hasAccess: true } });
+  } catch (error) {
+    return handleError(res, error);
+  }
+});
+
+// === Activity Log (audit trail for admin/staff) ===
+app.get('/api/staff/activity-log', requireAuth, requireStaff, async (req, res) => {
+  try {
+    const limit = clampInt(req.query.limit, 50, 1, 200);
+    const { data, error } = await supabaseAdmin
+      .from('activity_logs')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .limit(limit);
+    if (error) throw error;
+    res.json({ ok: true, message: 'Activity log loaded.', data: { logs: data || [] } });
+  } catch (error) {
+    return handleError(res, error);
+  }
+});
+
+// === Diagnosis (system health with role-based detail) ===
+app.get('/api/diagnosis', requireAuth, async (req, res) => {
+  try {
+    const now = new Date();
+    const result = {
+      timestamp: now.toISOString(),
+      service: 'backend',
+      status: 'operational',
+      role: req.auth.user.role,
+      actor: { id: req.auth.user.id, name: req.auth.user.name },
+      systemChecks: {},
+    };
+
+    // 1. Supabase Check
+    try {
+      if (supabaseAdmin) {
+        const start = Date.now();
+        const { data: profileCheck, error: profileErr } = await supabaseAdmin
+          .from('profiles').select('id').limit(1);
+        result.systemChecks.supabase = {
+          reachable: !profileErr,
+          pingMs: Date.now() - start,
+          error: profileErr ? profileErr.message : null,
+          data: profileCheck,
+        };
+      } else {
+        result.systemChecks.supabase = { reachable: false, error: 'Supabase Admin not initialized' };
+      }
+    } catch (e) {
+      result.systemChecks.supabase = { reachable: false, error: e.message };
+    }
+
+    // 2. Firebase Check
+    try {
+      const start = Date.now();
+      const snap = await db.collection('venues').limit(1).get();
+      result.systemChecks.firebase = {
+        reachable: true,
+        pingMs: Date.now() - start,
+        mocked: typeof snap.empty !== 'boolean' || hasFirebaseServerCredentials === true,
+      };
+    } catch (e) {
+      result.systemChecks.firebase = { reachable: false, error: e.message };
+    }
+
+    // 3. Client Backend Check
+    try {
+      const start = Date.now();
+      const cbRes = await fetch(`${CLIENT_BACKEND_URL}/health`);
+      const cbData = await cbRes.json().catch(() => null);
+      result.systemChecks.clientBackend = {
+        reachable: cbRes.ok,
+        status: cbRes.status,
+        pingMs: Date.now() - start,
+        response: cbData,
+      };
+    } catch (e) {
+      result.systemChecks.clientBackend = { reachable: false, error: e.message };
+    }
+
+    // 4. Payments Server Check
+    try {
+      const start = Date.now();
+      const pRes = await fetch(`${PAYMENTS_URL}/health`);
+      const pData = await pRes.json().catch(() => null);
+      result.systemChecks.paymentsServer = {
+        reachable: pRes.ok,
+        status: pRes.status,
+        pingMs: Date.now() - start,
+        response: pData,
+      };
+    } catch (e) {
+      result.systemChecks.paymentsServer = { reachable: false, error: e.message };
+    }
+
+    res.json({ ok: true, message: 'Comprehensive diagnosis complete.', data: result });
   } catch (error) {
     return handleError(res, error);
   }
