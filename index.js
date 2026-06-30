@@ -107,13 +107,18 @@ async function captureBookingPayment(bookingId) {
       body: JSON.stringify({ referenceId: bookingId }),
     });
     const result = await res.json();
-    if (!res.ok || !result.ok) {
+    const captureSucceeded = result.ok === true || result.success === true;
+    if (!res.ok || !captureSucceeded) {
       console.warn(`[PAYMENTS CAPTURE WARNING] Booking ${bookingId}:`, result.message);
+      throw { status: 502, message: result.message || 'Payment capture failed.' };
     } else {
       console.log(`[PAYMENTS CAPTURE SUCCESS] Booking ${bookingId} captured successfully.`);
     }
+    return result;
   } catch (err) {
     console.error(`[PAYMENTS CAPTURE ERROR] Failed to capture booking ${bookingId}:`, err);
+    if (err && err.status) throw err;
+    throw { status: 502, message: 'Payment capture failed. Booking was not confirmed.' };
   }
 }
 const DEFAULT_ADMIN_EMAIL = process.env.DEFAULT_ADMIN_EMAIL;
@@ -2081,6 +2086,8 @@ app.post('/api/admin/bookings/:bookingId/confirm', requireAuth, requireBookingOp
     }
     const ticketCode = crypto.randomBytes(4).toString('hex').toUpperCase();
     const verificationToken = crypto.randomBytes(24).toString('hex');
+    await captureBookingPayment(req.params.bookingId);
+
     await ref.set({
       status: 'confirmed',
       ticketCode,
@@ -2089,10 +2096,6 @@ app.post('/api/admin/bookings/:bookingId/confirm', requireAuth, requireBookingOp
       confirmedAt: nowIso(),
       updatedAt: nowIso(),
     }, { merge: true });
-    
-    // Attempt to capture payment since booking is approved
-    captureBookingPayment(req.params.bookingId);
-
     const snap = await ref.get();
     res.json({ ok: true, message: 'Booking confirmed. Ticket generated.', booking: toBooking(snap) });
   } catch (error) {
@@ -2107,10 +2110,9 @@ app.post('/api/admin/bookings/:bookingId/ticket', requireAuth, requireBookingOpe
     if (!current.exists || !canAccessOperationalBooking(req, toBooking(current))) {
       return res.status(404).json({ ok: false, message: 'Booking not found.' });
     }
+    await captureBookingPayment(req.params.bookingId);
+
     await ref.set({ ticketImage: req.body.ticketImage || null, status: 'confirmed', confirmedAt: nowIso() }, { merge: true });
-    
-    // Attempt to capture payment since booking is approved
-    captureBookingPayment(req.params.bookingId);
 
     const snap = await ref.get();
     res.json({ ok: true, message: 'Ticket uploaded and booking approved.', booking: toBooking(snap) });
@@ -2382,20 +2384,11 @@ app.post('/api/access/grant-ad', requireAuth, writeLimiter, async (req, res) => 
   }
 });
 
-// On successful premium payment verify (via proxy), the caller (frontend after verify) can hit this
-// or we auto-upgrade in verify path. This allows explicit refresh too.
 app.post('/api/access/activate-premium', requireAuth, async (req, res) => {
-  try {
-    const { error } = await supabaseAdmin.from('profiles').update({
-      is_premium: true,
-      premium_since: nowIso(),
-      updated_at: nowIso(),
-    }).eq('id', req.auth.user.id);
-    if (error) throw error;
-    res.json({ ok: true, message: 'Premium activated.', data: { isPremium: true, hasAccess: true } });
-  } catch (error) {
-    return handleError(res, error);
-  }
+  res.status(410).json({
+    ok: false,
+    message: 'Premium activation must be completed through verified payment.',
+  });
 });
 
 // === Activity Log (audit trail for admin/staff) ===
