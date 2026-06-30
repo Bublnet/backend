@@ -121,6 +121,41 @@ async function captureBookingPayment(bookingId) {
     throw { status: 502, message: 'Payment capture failed. Booking was not confirmed.' };
   }
 }
+
+function money(value) {
+  const parsed = Number(value || 0);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function paymentModeFromMetadata(metadata = {}) {
+  const paymentType = metadata.payment_type || metadata.paymentType || metadata.mode;
+  if (paymentType === 'reserve_20') return 'Reserve 20%';
+  if (paymentType === 'full') return 'Full';
+  return 'Full';
+}
+
+function paymentBreakdown(payment, booking) {
+  const paidAmount = money(payment.amount);
+  const fullAmount = money(booking?.amount || paidAmount);
+  const gatewayFee = money(payment.fee);
+  const gatewayTax = money(payment.tax);
+  const platformFee = money(payment.metadata?.platform_fee || payment.metadata?.platformFee || 0);
+  const taxableAmount = paidAmount > 0 ? paidAmount / 1.18 : 0;
+  const gstAmount = Math.max(0, paidAmount - taxableAmount);
+  return {
+    paymentMode: paymentModeFromMetadata(payment.metadata),
+    fullAmount,
+    paidAmount,
+    pendingAmount: Math.max(0, fullAmount - paidAmount),
+    taxableAmount,
+    gstRate: 18,
+    gstAmount,
+    platformFee,
+    gatewayFee,
+    gatewayTax,
+    netAfterFees: Math.max(0, paidAmount - gatewayFee),
+  };
+}
 const DEFAULT_ADMIN_EMAIL = process.env.DEFAULT_ADMIN_EMAIL;
 const ADMIN_LOGIN_IDENTIFIER = process.env.ADMIN_LOGIN_IDENTIFIER;
 const ADMIN_LOGIN_PASSWORD = process.env.ADMIN_LOGIN_PASSWORD;
@@ -2023,7 +2058,7 @@ app.get('/api/admin/bookings', requireAuth, requireBookingOperator, async (req, 
   const snap = await db.collection('bookings').orderBy('bookedAt', 'desc').get();
   const bookings = snap.docs.map(toBooking)
     .filter((booking) => canAccessOperationalBooking(req, booking))
-    .filter((booking) => status === 'all' || booking.status === status || booking.paymentStatus === status)
+    .filter((booking) => status === 'all' || booking.status === status)
     .filter((booking) => !q || `${booking.venueName} ${booking.customerName}`.toLowerCase().includes(q));
   const start = (page - 1) * limit;
   res.json({
@@ -2075,6 +2110,95 @@ app.get('/api/admin/analytics/bookings', requireAuth, requireStaff, async (req, 
     summary: { totalRevenue, totalBookings: bookings.length },
     points: [...byDate.values()].sort((a, b) => a.label.localeCompare(b.label)).slice(-14),
   });
+});
+
+app.get('/api/admin/payments', requireAuth, requireStaff, async (req, res) => {
+  try {
+    const period = String(req.query.period || 'month');
+    const limit = clampInt(req.query.limit, 200, 1, 500);
+    const upstream = await fetch(
+      `${PAYMENTS_URL}/api/admin/payments?period=${encodeURIComponent(period)}&limit=${limit}`,
+      {
+        headers: {
+          Accept: 'application/json',
+          ...(process.env.INTERNAL_SERVICE_TOKEN
+            ? { 'X-Internal-Service-Token': process.env.INTERNAL_SERVICE_TOKEN }
+            : {}),
+        },
+      },
+    );
+    const data = await upstream.json();
+    if (!upstream.ok || data.ok === false) {
+      return res.status(upstream.status || 502).json({
+        ok: false,
+        message: data.message || 'Could not load payment summary.',
+      });
+    }
+
+    const payments = Array.isArray(data.payments) ? data.payments : [];
+    const bookingIds = [...new Set(
+      payments
+        .filter((payment) => payment.type === 'booking' && payment.referenceId)
+        .map((payment) => payment.referenceId),
+    )];
+    const bookingMap = new Map();
+    await Promise.all(bookingIds.map(async (bookingId) => {
+      try {
+        const snap = await db.collection('bookings').doc(bookingId).get();
+        if (snap.exists) bookingMap.set(bookingId, toBooking(snap));
+      } catch (error) {
+        console.warn(`[ADMIN PAYMENTS] Could not load booking ${bookingId}:`, error.message);
+      }
+    }));
+
+    const orders = payments.map((payment) => {
+      const booking = bookingMap.get(payment.referenceId) || null;
+      const breakdown = paymentBreakdown(payment, booking);
+      return {
+        ...payment,
+        booking,
+        venue: booking ? {
+          id: booking.venueId,
+          name: booking.venueName,
+          address: booking.venueAddress || null,
+          ownerId: booking.ownerId || null,
+          ownerName: booking.ownerName || null,
+        } : null,
+        customer: booking ? {
+          id: booking.userId || payment.userId || null,
+          name: booking.customerName,
+          phone: booking.customerPhone || payment.contact || null,
+          email: payment.email || null,
+        } : {
+          id: payment.userId || null,
+          name: '',
+          phone: payment.contact || null,
+          email: payment.email || null,
+        },
+        breakdown,
+      };
+    });
+
+    const summary = {
+      ...(data.summary || {}),
+      totalOrders: orders.length,
+      totalFullBookingValue: orders.reduce((sum, order) => sum + money(order.breakdown?.fullAmount), 0),
+      totalPendingBalance: orders.reduce((sum, order) => sum + money(order.breakdown?.pendingAmount), 0),
+      totalGatewayFee: orders.reduce((sum, order) => sum + money(order.breakdown?.gatewayFee), 0),
+      totalNetAfterFees: orders.reduce((sum, order) => sum + money(order.breakdown?.netAfterFees), 0),
+    };
+
+    return res.json({
+      ok: true,
+      message: 'Payments loaded.',
+      period: data.period || period,
+      generatedAt: data.generatedAt || nowIso(),
+      summary,
+      orders,
+    });
+  } catch (error) {
+    return handleError(res, error);
+  }
 });
 
 app.post('/api/admin/bookings/:bookingId/confirm', requireAuth, requireBookingOperator, async (req, res) => {
