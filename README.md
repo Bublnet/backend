@@ -40,7 +40,7 @@ starting the services.
    npm run dev
    ```
 
-The default port is `4000`. Set `PAYMENTS_SERVICE_URL=http://localhost:4001` when the payments service is running locally.
+The default port is `4000`. The code now defaults to the deployed payments service at `https://payments-brown-one.vercel.app`. For local development, set `PAYMENTS_SERVICE_URL=http://localhost:4001`.
 
 ## Firebase
 
@@ -140,9 +140,9 @@ containing `asdf_` tokens.
 
 ## Production Notes
 
-- Set `CORS_ORIGINS` to the deployed Flutter URL, for example `https://dvenueapp.vercel.app`.
+- Set `CORS_ORIGINS` to the deployed Flutter URL, for example `https://web-two-eta-91.vercel.app`.
 - For **local testing**, copy `.env.example` → `.env` and ensure it includes your Flutter dev server:
   - Default Flutter web: `http://localhost:8080,http://127.0.0.1:8080`
   - Also add `http://localhost:5000` if your Flutter instance uses that port.
-- Build Flutter with `--dart-define=API_BASE_URL=<backend-url>` when you are ready to connect the frontend to this backend.
+- Build Flutter with `--dart-define=API_BASE_URL=https://backend-eta-livid-40.vercel.app` when you are ready to connect the frontend to this backend.
 - No service can be "unhackable"; this backend uses the practical baseline: Firebase Admin token verification, server-side Firestore writes, role checks, ownership checks, rate limits, Helmet headers, and fail-closed config guards.

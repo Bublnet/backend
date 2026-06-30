@@ -34,8 +34,8 @@ const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = process.env.PORT || 4000;
-const PAYMENTS_URL = process.env.PAYMENTS_SERVICE_URL || 'http://localhost:4001';
-const CLIENT_BACKEND_URL = process.env.CLIENT_BACKEND_URL || 'http://localhost:4002';
+const PAYMENTS_URL = process.env.PAYMENTS_SERVICE_URL || 'https://payments-brown-one.vercel.app';
+const CLIENT_BACKEND_URL = process.env.CLIENT_BACKEND_URL || 'https://clientbackend-three.vercel.app';
 const FIREBASE_API_KEY = process.env.FIREBASE_API_KEY || firebaseConfig?.apiKey;
 
 function cleanForFirestore(value) {
@@ -749,12 +749,24 @@ app.get('/health', async (req, res) => {
 });
 
 app.get('/api/config/public', async (req, res) => {
-  const discSnap = await db.collection('settings').doc('discounts').get();
-  const discountRules = discSnap.exists && discSnap.data().rules ? discSnap.data().rules : [
+  const defaultDiscountRules = [
     { maxDays: 1, percent: 60 },
     { maxDays: 6, percent: 45 },
     { maxDays: 13, percent: 30 }
   ];
+
+  let discountRules = defaultDiscountRules;
+  try {
+    const discSnap = await Promise.race([
+      db.collection('settings').doc('discounts').get(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('Discount settings lookup timed out.')), 2500)),
+    ]);
+    if (discSnap?.exists && discSnap.data().rules) {
+      discountRules = discSnap.data().rules;
+    }
+  } catch (error) {
+    console.warn('[CONFIG PUBLIC] Falling back to default discount rules:', error.message);
+  }
 
   res.json({
     ok: true,
