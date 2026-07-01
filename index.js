@@ -187,10 +187,21 @@ function assertFirebaseServerConfigured() {
   throw error;
 }
 
-const allowedOrigins = (process.env.CORS_ORIGINS || '')
+const defaultCorsOrigins = [
+  'https://dvenue.space',
+  'https://www.dvenue.space',
+  'https://web-two-eta-91.vercel.app',
+  'https://web-alfasbadars-projects.vercel.app',
+  'https://web-alfasbadar-alfasbadars-projects.vercel.app',
+];
+
+const allowedOrigins = [
+  ...defaultCorsOrigins,
+  ...(process.env.CORS_ORIGINS || '')
   .split(',')
   .map((origin) => origin.trim())
-  .filter(Boolean);
+  .filter(Boolean),
+];
 
 app.set('trust proxy', 1);
 
