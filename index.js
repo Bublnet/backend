@@ -12,6 +12,8 @@ import {
   normalizeRole,
   supabaseAdmin,
 } from './supabase.client.js';
+
+import { analyticsMiddleware, logAnalyticsEvent } from './analysis/analytics_logger.js';
 import { removeListing } from './remove_listing.js';
 import helmet from 'helmet';
 import fetch from 'node-fetch';
@@ -34,10 +36,22 @@ const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = process.env.PORT || 4000;
-const PAYMENTS_URL = process.env.PAYMENTS_SERVICE_URL || 'https://payments-brown-one.vercel.app';
-const CLIENT_BACKEND_URL = process.env.CLIENT_BACKEND_URL || 'https://clientbackend-three.vercel.app';
+const APP_MODE = process.env.APP_MODE || (process.env.NODE_ENV === 'production' ? 'production' : 'test');
+
+const PROD_FRONTEND_URL = 'https://dvenue.space';
+const TEST_FRONTEND_URL = 'http://localhost:8080';
+const FRONTEND_URL = APP_MODE === 'production' ? PROD_FRONTEND_URL : TEST_FRONTEND_URL;
+
+const PROD_PAYMENTS_URL = 'https://payments-brown-one.vercel.app';
+const TEST_PAYMENTS_URL = 'http://localhost:4001';
+const PAYMENTS_URL = process.env.PAYMENTS_SERVICE_URL || (APP_MODE === 'production' ? PROD_PAYMENTS_URL : TEST_PAYMENTS_URL);
+
+const PROD_CLIENT_BACKEND_URL = 'https://clientbackend-three.vercel.app';
+const TEST_CLIENT_BACKEND_URL = 'http://localhost:4002';
+const CLIENT_BACKEND_URL = process.env.CLIENT_BACKEND_URL || (APP_MODE === 'production' ? PROD_CLIENT_BACKEND_URL : TEST_CLIENT_BACKEND_URL);
+
 const FIREBASE_API_KEY = process.env.FIREBASE_API_KEY || firebaseConfig?.apiKey;
-const AUTH_REDIRECT_URL = process.env.AUTH_REDIRECT_URL || 'https://dvenue.space';
+const AUTH_REDIRECT_URL = process.env.AUTH_REDIRECT_URL || FRONTEND_URL;
 
 function cleanForFirestore(value) {
   if (value === null || typeof value !== 'object') {
@@ -203,6 +217,9 @@ const allowedOrigins = [
   .map((origin) => origin.trim())
   .filter(Boolean),
 ];
+
+// Track all backend traffic
+app.use(analyticsMiddleware('backend'));
 
 app.set('trust proxy', 1);
 
@@ -460,6 +477,40 @@ async function requireAuth(req, res, next) {
     }
     console.error('Auth verification failed:', error.message);
     return res.status(401).json({ ok: false, message: 'Session expired. Please login again.' });
+  }
+}
+
+async function optionalAuth(req, res, next) {
+  try {
+    if (req.auth?.source === 'env-admin') return next();
+    const header = req.get('authorization') || '';
+    const match = header.match(/^Bearer\s+(.+)$/i);
+    if (!match) {
+      return next();
+    }
+
+    if (ADMIN_TOKEN_PATTERN.test(match[1])) {
+      await authenticateEnvAdminToken(match[1], req);
+      return next();
+    }
+
+    const identity = await getSupabaseIdentity(match[1]);
+    const decoded = {
+      uid: identity.authUser.id,
+      sub: identity.authUser.id,
+      email: identity.authUser.email,
+    };
+    req.auth = {
+      source: 'supabase',
+      token: match[1],
+      decoded,
+      user: publicUser(identity.profile),
+      profile: identity.profile,
+    };
+    return next();
+  } catch (error) {
+    // optional auth ignores errors
+    return next();
   }
 }
 
@@ -2633,7 +2684,112 @@ app.get('/api/diagnosis', requireAuth, async (req, res) => {
   }
 });
 
-app.use((req, res) => {
+// --- ANALYTICS TRACKING ROUTE ---
+app.post('/api/analytics/track', optionalAuth, async (req, res) => {
+  try {
+    const { eventName, eventType, serviceName, metadata, deviceType, venueId, venueSpeciality } = req.body;
+    if (!eventName) return res.status(400).json({ ok: false, message: 'Event name required.' });
+
+    const ipAddress = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+    const country = req.headers['cf-ipcountry'] || req.headers['x-vercel-ip-country'];
+    const state = req.headers['x-vercel-ip-country-region'];
+    const city = req.headers['x-vercel-ip-city'];
+
+    await logAnalyticsEvent({
+      serviceName: serviceName || 'frontend',
+      eventType: eventType || 'click',
+      eventName,
+      userId: req.auth?.user?.id,
+      ipAddress,
+      country,
+      state,
+      city,
+      deviceType,
+      venueId,
+      venueSpeciality,
+      metadata
+    });
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ ok: false });
+  }
+});
+
+app.get('/api/analytics/summary', requireAuth, async (req, res) => {
+  try {
+    if (!['admin', 'staff'].includes(req.auth.user.role)) {
+      return res.status(403).json({ ok: false, message: 'Forbidden' });
+    }
+
+    if (!supabaseAdmin) {
+      return res.status(500).json({ ok: false, message: 'Supabase admin not configured.' });
+    }
+
+    // Basic aggregation (in a real production app, do this via RPC or group by in DB)
+    const { data: events, error } = await supabaseAdmin
+      .from('activity_logs')
+      .select('created_at, action, target_type, target_name, actor_name, actor_role, details')
+      .order('created_at', { ascending: false })
+      .limit(1000);
+
+    if (error) throw error;
+
+    let totalVisits = 0;
+    let signups = 0;
+    let bookingClicks = 0;
+    let activeVenues = 0;
+
+    const traffic = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0 };
+    const funnel = { splash: 0, home: 0, detail: 0, book: 0 };
+    const logs = [];
+
+    if (events) {
+      for (const e of events) {
+        if (e.action === 'page_view') totalVisits++;
+        if (e.action === 'signup') signups++;
+        if (e.action === 'booking_requested' || e.action === 'booking') bookingClicks++;
+
+        // Populate funnel based on details or target_name if possible, otherwise mock it up based on actions
+        if (e.target_name === 'splash_screen') funnel.splash++;
+        if (e.target_name === 'Home') funnel.home++;
+        if (e.target_type === 'venue') funnel.detail++;
+        if (e.action === 'booking_requested' || e.action === 'booking') funnel.book++;
+
+        // Add to logs for datatable
+        if (logs.length < 50) {
+          logs.push({
+            timestamp: e.created_at,
+            type: e.action,
+            ip: e.details?.ip_address || e.actor_name || 'Unknown',
+            service: e.details?.service_name || e.actor_role || 'backend',
+            status: e.details?.status_code?.toString() || 'Success'
+          });
+        }
+      }
+    }
+
+    res.json({
+      ok: true,
+      data: {
+        totalVisits,
+        signups,
+        bookingClicks,
+        activeVenues: 15, // placeholder
+        traffic: [traffic[1], traffic[2], traffic[3], traffic[4], traffic[5], traffic[6]],
+        funnel: [funnel.splash, funnel.home, funnel.detail, funnel.book],
+        logs
+      }
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ ok: false });
+  }
+});
+
+// Fallback 404
+app.use((req, res, next) => {
   res.status(404).json({ ok: false, message: 'Route not found.' });
 });
 
