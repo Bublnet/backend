@@ -37,6 +37,7 @@ const PORT = process.env.PORT || 4000;
 const PAYMENTS_URL = process.env.PAYMENTS_SERVICE_URL || 'https://payments-brown-one.vercel.app';
 const CLIENT_BACKEND_URL = process.env.CLIENT_BACKEND_URL || 'https://clientbackend-three.vercel.app';
 const FIREBASE_API_KEY = process.env.FIREBASE_API_KEY || firebaseConfig?.apiKey;
+const AUTH_REDIRECT_URL = process.env.AUTH_REDIRECT_URL || 'https://dvenue.space';
 
 function cleanForFirestore(value) {
   if (value === null || typeof value !== 'object') {
@@ -751,12 +752,18 @@ async function firebasePasswordRequest(action, payload) {
     return { idToken: data.session.access_token, localId: data.user.id, email: data.user.email };
   }
   if (action === 'signUp') {
-    const { data, error } = await supabaseAdmin.auth.signUp({ email: payload.email, password: payload.password });
+    const { data, error } = await supabaseAdmin.auth.signUp({
+      email: payload.email,
+      password: payload.password,
+      options: { emailRedirectTo: AUTH_REDIRECT_URL },
+    });
     if (error) throw { status: 400, message: error.message };
     return { idToken: data.session?.access_token || '', localId: data.user.id, email: data.user.email };
   }
   if (action === 'sendOobCode') {
-    const { error } = await supabaseAdmin.auth.resetPasswordForEmail(payload.email);
+    const { error } = await supabaseAdmin.auth.resetPasswordForEmail(payload.email, {
+      redirectTo: AUTH_REDIRECT_URL,
+    });
     if (error) throw { status: 400, message: error.message };
     return {};
   }
@@ -976,6 +983,7 @@ app.post('/api/auth/signup', authLimiter, async (req, res) => {
     const { data: signup, error: signupError } = await supabaseAdmin.auth.signUp({
       email: identifier,
       password,
+      options: { emailRedirectTo: AUTH_REDIRECT_URL },
     });
     if (signupError) throw signupError;
     const token = signup.session?.access_token || null;
@@ -1002,7 +1010,7 @@ app.post('/api/auth/password-reset/start', authLimiter, async (req, res) => {
   try {
     const identifier = normalizeIdentifier(req.body.identifier);
     const { error } = await supabaseAdmin.auth.resetPasswordForEmail(identifier, {
-      redirectTo: 'https://dvenue.space',
+      redirectTo: AUTH_REDIRECT_URL,
     });
     if (error) throw error;
     res.json({ ok: true, message: 'Password reset email sent.' });
