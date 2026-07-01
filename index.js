@@ -1001,7 +1001,9 @@ app.post('/api/auth/signup/complete', authLimiter, async (req, res) => {
 app.post('/api/auth/password-reset/start', authLimiter, async (req, res) => {
   try {
     const identifier = normalizeIdentifier(req.body.identifier);
-    const { error } = await supabaseAdmin.auth.resetPasswordForEmail(identifier);
+    const { error } = await supabaseAdmin.auth.resetPasswordForEmail(identifier, {
+      redirectTo: 'https://dvenue.space',
+    });
     if (error) throw error;
     res.json({ ok: true, message: 'Password reset email sent.' });
   } catch (error) {
