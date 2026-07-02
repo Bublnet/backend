@@ -115,7 +115,7 @@ async function captureBookingPayment(bookingId) {
   try {
     const res = await fetch(`${PAYMENTS_URL}/api/capture-payment`, {
       method: 'POST',
-      headers: { 
+      headers: {
         'Content-Type': 'application/json',
         ...(process.env.INTERNAL_SERVICE_TOKEN && { 'X-Internal-Service-Token': process.env.INTERNAL_SERVICE_TOKEN })
       },
@@ -1310,33 +1310,42 @@ app.get('/api/venues/:venueId/availability', async (req, res) => {
     const { year, month } = req.query;
     if (!year || !month) return res.status(400).json({ ok: false, message: 'Missing year/month' });
 
-    const prefix = `${year}-${String(month).padStart(2, '0')}`;
-    const snap = await db.collection('bookings')
-      .where('venueId', '==', req.params.venueId)
-      .get();
-      
-    const bookedByMe = new Set();
-    const booked = new Set();
-    
-    snap.docs.forEach((doc) => {
-      const booking = toBooking(doc);
-      if (['pending', 'confirmed'].includes(booking.status)) {
-        const dates = booking.eventDate.split('; ');
-        for (const d of dates) {
-          if (d.startsWith(prefix)) {
-            booked.add(d);
-            if (uid && booking.userId === uid) {
-              bookedByMe.add(d);
-            }
-          }
-        }
-      }
-    });
     const venueSnap = await db.collection('venues').doc(req.params.venueId).get();
     if (!venueSnap.exists) {
       return res.status(404).json({ ok: false, message: 'Listing not found.' });
     }
     const venue = toListing(venueSnap);
+
+    const prefix = `${year}-${String(month).padStart(2, '0')}`;
+    const snap = await db.collection('bookings')
+      .where('venueId', '==', req.params.venueId)
+      .get();
+
+    const bookedByMe = new Set();
+    const booked = new Set();
+
+    snap.docs.forEach((doc) => {
+      const booking = toBooking(doc);
+      if (['pending', 'confirmed'].includes(booking.status)) {
+        // ONLY hold space if booking is paid, confirmed, host-owned, or admin-owned
+        const isPaid = booking.paymentStatus === 'paid';
+        const isConfirmed = booking.status === 'confirmed';
+        const isHost = booking.userId === venue.ownerId;
+        const isAdmin = booking.userId === 'env-admin' || booking.userId === 'admin';
+
+        if (isPaid || isConfirmed || isHost || isAdmin) {
+          const dates = booking.eventDate.split('; ');
+          for (const d of dates) {
+            if (d.startsWith(prefix)) {
+              booked.add(d);
+              if (uid && booking.userId === uid) {
+                bookedByMe.add(d);
+              }
+            }
+          }
+        }
+      }
+    });
     const primarySpace = venue.spaces?.[0] || {};
     const overrides = primarySpace.calendarOverrides || {};
     const originalRate = Number(primarySpace.dayPrice || primarySpace.nightPrice || venue.priceWithGst || venue.basePrice || 0);
@@ -1355,20 +1364,20 @@ app.get('/api/venues/:venueId/availability', async (req, res) => {
     const days = Array.from({ length: daysInMonth }, (_, i) => {
       const date = `${prefix}-${String(i + 1).padStart(2, '0')}`;
       const override = overrides[date] || {};
-      
+
       const isFullyBookedByHost = override.status === 'booked';
       const isDayBookedByHost = override.status === 'day_booked';
       const isNightBookedByHost = override.status === 'night_booked';
-      
+
       const isPast = date < todayKey;
       const isFullyBooked = booked.has(date) || isFullyBookedByHost;
 
       const baseDiscountPercent = Math.max(0, Math.min(100, Number(override.discountPercent || 0)));
-      
+
       const eventDay = new Date(date);
       const todayDate = new Date(); todayDate.setHours(0, 0, 0, 0);
       const diffDays = Math.round((eventDay - todayDate) / (1000 * 60 * 60 * 24));
-      
+
       let autoDiscountPercent = 0;
       const sortedRules = [...discountRules].sort((a, b) => a.maxDays - b.maxDays);
       for (const rule of sortedRules) {
@@ -1379,7 +1388,7 @@ app.get('/api/venues/:venueId/availability', async (req, res) => {
       }
       const discountPercent = Math.max(baseDiscountPercent, autoDiscountPercent);
       const applyDiscount = (val) => val ? Math.round(val * (1 - discountPercent / 100)) : null;
-      
+
       const rate = applyDiscount(originalRate);
       let dayRate = applyDiscount(originalDayRate);
       let nightRate = applyDiscount(originalNightRate);
@@ -1387,7 +1396,7 @@ app.get('/api/venues/:venueId/availability', async (req, res) => {
       if (booked.has(`${date}|day`) || isDayBookedByHost) dayRate = null;
       if (booked.has(`${date}|night`) || isNightBookedByHost) nightRate = null;
 
-      const isEffectivelyBooked = isFullyBooked || 
+      const isEffectivelyBooked = isFullyBooked ||
         ((originalDayRate != null || originalNightRate != null) && dayRate == null && nightRate == null);
 
       let finalStatus = 'available';
@@ -1427,7 +1436,7 @@ app.post('/api/venues', requireAuth, writeLimiter, async (req, res) => {
 
 app.put('/api/venues/:id', requireAuth, writeLimiter, async (req, res) => {
   const isCalendarUpdate = req.body?.calendarOnly === true;
-  
+
   // If only updating calendar, don't rely on the proxy to preserve the complex calendarOverrides JSON
   // We sync directly to Firebase first.
   if (isCalendarUpdate) {
@@ -1438,18 +1447,21 @@ app.put('/api/venues/:id', requireAuth, writeLimiter, async (req, res) => {
         const before = toListing(currentSnap);
         const updatedSpaces = Array.isArray(req.body.spaces) ? req.body.spaces : before.spaces;
         const after = cleanForFirestore({ ...before, spaces: updatedSpaces, updatedAt: nowIso() });
+        const calendarSource = req.body?.modifiedByAdmin === true
+          ? 'admin_calendar'
+          : 'owner_calendar';
         await writeVenueWithHistory({
           venueId: req.params.id,
           before,
           after,
           actor: req.auth.user,
-          source: 'owner_calendar',
+          source: calendarSource,
         });
         await syncVenueToPayments(after);
-        
+
         // Optionally notify the proxy asynchronously, but don't depend on its response for the spaces data
         proxyClientData(req).catch(console.error);
-        
+
         return res.json({ ok: true, message: 'Calendar updated and published successfully.' });
       }
     } catch (error) {
@@ -1464,7 +1476,7 @@ app.put('/api/venues/:id', requireAuth, writeLimiter, async (req, res) => {
   // Normal full listing update
   const result = await proxyClientData(req);
   if (result.status < 300 && result.data?.ok === true) {
-    // If it was a normal update that somehow got here, we don't need to do anything special 
+    // If it was a normal update that somehow got here, we don't need to do anything special
     // unless there's a specific requirement to sync it immediately to venues.
   }
   res.status(result.status).json(result.data);
@@ -1774,7 +1786,7 @@ app.post('/api/bookings', requireAuth, writeLimiter, async (req, res) => {
     // Handle multiple dates joined by "; "
     const dates = eventDateRaw.split('; ');
     let totalServerFinalAmount = 0;
-    
+
     // Auto-discount: use dynamic global rules
     const discSnap = await db.collection('settings').doc('discounts').get();
     const discountRules = discSnap.exists && discSnap.data().rules ? discSnap.data().rules : [
@@ -1793,7 +1805,7 @@ app.post('/api/bookings', requireAuth, writeLimiter, async (req, res) => {
       const eventDay = new Date(dateString);
       const todayDate = new Date(); todayDate.setHours(0, 0, 0, 0);
       const diffDays = Math.round((eventDay - todayDate) / (1000 * 60 * 60 * 24));
-      
+
       let autoDiscountPercent = 0;
       const sortedRules = [...discountRules].sort((a, b) => a.maxDays - b.maxDays);
       for (const rule of sortedRules) {
@@ -1819,7 +1831,7 @@ app.post('/api/bookings', requireAuth, writeLimiter, async (req, res) => {
       } else if (primarySpace.dayPrice || primarySpace.nightPrice) {
         baseAmount = venue.priceWithGst || venue.basePrice || 0;
       }
-      
+
       totalServerFinalAmount += Math.round(baseAmount * (1 - discountPercent / 100));
     }
 
@@ -1837,39 +1849,65 @@ app.post('/api/bookings', requireAuth, writeLimiter, async (req, res) => {
       .where('venueId', '==', venueId)
       .where('eventDate', '==', eventDateRaw)
       .where('status', 'in', ['pending', 'confirmed'])
-      .limit(1)
       .get();
+
+    let hasConflict = false;
+    let myResumableDoc = null;
+    let myResumableData = null;
+
     if (!duplicate.empty) {
-      const dup = duplicate.docs[0];
-      const dupData = typeof dup.data === 'function' ? dup.data() : dup;
-      if (dupData.status === 'pending' && dupData.userId === req.auth.user.id) {
-        if (dupData.amount === 0 && finalAmount > 0) {
-          await db.collection('bookings').doc(dup.id).set({ amount: finalAmount }, { merge: true });
-          dupData.amount = finalAmount;
+      for (const doc of duplicate.docs) {
+        const dupData = doc.data();
+        const isMyOwnPending = dupData.status === 'pending' && dupData.userId === req.auth.user.id;
+
+        if (isMyOwnPending) {
+          myResumableDoc = doc;
+          myResumableData = dupData;
+          continue;
         }
-        // Sync resuming booking to Supabase so payments service can read it
-        if (supabaseAdmin) {
-          await supabaseAdmin.from('bookings').upsert({
-            id: dup.id,
-            venueId: dupData.venueId,
-            venueName: dupData.venueName,
-            userId: dupData.userId,
-            customerName: dupData.customerName,
-            amount: dupData.amount,
-            status: dupData.status,
-            paymentStatus: dupData.paymentStatus,
-            eventDate: dupData.eventDate,
-            bookedAt: dupData.bookedAt,
-          }, { onConflict: 'id' });
-          console.log(`[BOOKING SUPABASE SYNC] Upserted resuming booking ${dup.id} amount=${dupData.amount}`);
+
+        // It's a conflict if another booking is paid, confirmed, host-owned, or admin-owned
+        const isPaid = dupData.paymentStatus === 'paid';
+        const isConfirmed = dupData.status === 'confirmed';
+        const isHost = dupData.userId === venue.ownerId;
+        const isAdmin = dupData.userId === 'env-admin' || dupData.userId === 'admin';
+
+        if (isPaid || isConfirmed || isHost || isAdmin) {
+          hasConflict = true;
         }
-        return res.status(200).json({ 
-          ok: true, 
-          message: 'Resuming existing booking for payment.', 
-          booking: { id: dup.id, ...dupData } 
-        });
       }
+    }
+
+    if (hasConflict) {
       return res.status(409).json({ ok: false, message: 'This date/slot is already reserved.' });
+    }
+
+    if (myResumableDoc != null && myResumableData != null) {
+      if (myResumableData.amount === 0 && finalAmount > 0) {
+        await db.collection('bookings').doc(myResumableDoc.id).set({ amount: finalAmount }, { merge: true });
+        myResumableData.amount = finalAmount;
+      }
+      // Sync resuming booking to Supabase so payments service can read it
+      if (supabaseAdmin) {
+        await supabaseAdmin.from('bookings').upsert({
+          id: myResumableDoc.id,
+          venueId: myResumableData.venueId,
+          venueName: myResumableData.venueName,
+          userId: myResumableData.userId,
+          customerName: myResumableData.customerName,
+          amount: myResumableData.amount,
+          status: myResumableData.status,
+          paymentStatus: myResumableData.paymentStatus,
+          eventDate: myResumableData.eventDate,
+          bookedAt: myResumableData.bookedAt,
+        }, { onConflict: 'id' });
+        console.log(`[BOOKING SUPABASE SYNC] Upserted resuming booking ${myResumableDoc.id} amount=${myResumableData.amount}`);
+      }
+      return res.status(200).json({
+        ok: true,
+        message: 'Resuming existing booking for payment.',
+        booking: { id: myResumableDoc.id, ...myResumableData }
+      });
     }
 
     const bookingData = {
@@ -1993,6 +2031,46 @@ app.post('/api/bookings/:bookingId/pay', requireAuth, requirePremiumOrAd, async 
       return res.status(400).json({ ok: false, message: orderData.message || 'Could not create payment order' });
     }
     res.json({ ok: true, message: 'Payment order created.', order: orderData.order, booking });
+  } catch (error) {
+    return handleError(res, error);
+  }
+});
+
+app.post('/api/bookings/:bookingId/cancel', requireAuth, async (req, res) => {
+  try {
+    const bookingDoc = await db.collection('bookings').doc(req.params.bookingId).get();
+    if (!bookingDoc.exists) {
+      return res.status(404).json({ ok: false, message: 'Booking not found.' });
+    }
+    const booking = toBooking(bookingDoc);
+    if (booking.userId !== req.auth.user.id) {
+      return res.status(403).json({ ok: false, message: 'You do not have access to this booking.' });
+    }
+
+    const updateData = {
+      status: 'cancelled',
+      paymentStatus: 'cancelled',
+      cancelledAt: nowIso(),
+    };
+
+    await db.collection('bookings').doc(req.params.bookingId).set(updateData, { merge: true });
+
+    if (supabaseAdmin) {
+      const { error: sbError } = await supabaseAdmin
+        .from('bookings')
+        .update({
+          status: 'cancelled',
+          paymentStatus: 'cancelled',
+        })
+        .eq('id', req.params.bookingId);
+      if (sbError) {
+        console.error(`[BOOKING SUPABASE CANCEL ERROR] Failed to update booking ${req.params.bookingId}:`, sbError);
+      } else {
+        console.log(`[BOOKING SUPABASE CANCEL] Cancelled booking ${req.params.bookingId} in Supabase successfully`);
+      }
+    }
+
+    res.json({ ok: true, message: 'Booking cancelled successfully.' });
   } catch (error) {
     return handleError(res, error);
   }
@@ -2320,13 +2398,13 @@ app.post('/api/admin/bookings/:bookingId/ticket', requireAuth, requireBookingOpe
 app.get('/api/settings', requireAuth, requireAdmin, async (req, res) => {
   const snap = await db.collection('settings').doc('app').get();
   const discSnap = await db.collection('settings').doc('discounts').get();
-  res.json({ 
-    ok: true, 
-    message: 'Settings loaded.', 
-    data: { 
+  res.json({
+    ok: true,
+    message: 'Settings loaded.',
+    data: {
       settings: snap.exists ? snap.data() : {},
       discounts: discSnap.exists ? discSnap.data().rules : [],
-    } 
+    }
   });
 });
 
