@@ -95,7 +95,21 @@ function decodeFirestoreSpecTable(raw) {
 
 function sanitizeSpecTable(raw) {
   if (!raw || typeof raw !== 'object') {
-    return { columns: ["Specification", "Details"], rows: [["Area", ""], ["Parking", ""]] };
+    return {
+      columns: ['Specification', 'Details'],
+      rows: [
+        ['Parking', ''],
+        ['CCTV', ''],
+        ['WiFi', ''],
+        ['Air Conditioning', ''],
+        ['TV', ''],
+        ['Sound System', ''],
+        ['Stage', ''],
+        ['Catering', ''],
+        ['Security', ''],
+        ['Turf', ''],
+      ],
+    };
   }
   return {
     columns: Array.isArray(raw.columns)
@@ -107,7 +121,13 @@ function sanitizeSpecTable(raw) {
             ? row.map(cell => (typeof cell === 'string' ? cell : String(cell || '')))
             : []
         )
-      : [["Area", ""], ["Parking", ""]]
+      : [
+        ['Parking', ''],
+        ['CCTV', ''],
+        ['WiFi', ''],
+        ['Air Conditioning', ''],
+        ['TV', ''],
+      ]
   };
 }
 
@@ -287,6 +307,124 @@ function normalizeIdentifier(value) {
 
 function isEmail(value) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
+}
+
+function normalizePhone(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return null;
+  const digits = raw.replace(/\D/g, '');
+  if (digits.length < 10 || digits.length > 15) return null;
+  return raw;
+}
+
+function phoneFromIdentifier(identifier) {
+  const raw = String(identifier || '').trim();
+  if (!raw || isEmail(normalizeIdentifier(raw))) return null;
+  return normalizePhone(raw);
+}
+
+function pickVenuePhone(venue) {
+  if (!venue) return null;
+  const phone = String(venue.phone || '').trim();
+  if (phone) return phone;
+  return String(venue.altPhone || '').trim() || null;
+}
+
+async function lookupAuthUserPhone(userId) {
+  if (!userId || !supabaseAdmin) return null;
+  try {
+    const { data, error } = await supabaseAdmin.auth.admin.getUserById(userId);
+    if (error || !data?.user) return null;
+    const user = data.user;
+    return normalizePhone(user.phone) || normalizePhone(user.user_metadata?.phone) || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function lookupPaymentContacts(bookingIds) {
+  const map = new Map();
+  if (!bookingIds.length || !supabaseAdmin) return map;
+  const { data } = await supabaseAdmin
+    .from('payments')
+    .select('reference_id, metadata')
+    .in('reference_id', bookingIds)
+    .order('created_at', { ascending: false });
+  for (const row of data || []) {
+    if (!map.has(row.reference_id)) {
+      const contact = normalizePhone(row.metadata?.contact);
+      if (contact) map.set(row.reference_id, contact);
+    }
+  }
+  return map;
+}
+
+async function lookupVenuePhones(venueIds) {
+  const map = new Map();
+  if (!venueIds.length) return map;
+  await Promise.all(venueIds.map(async (venueId) => {
+    try {
+      const snap = await db.collection('venues').doc(venueId).get();
+      if (!snap.exists) return;
+      const phone = pickVenuePhone(toListing(snap));
+      if (phone) map.set(venueId, phone);
+    } catch (_) {
+      // ignore lookup failures for individual venues
+    }
+  }));
+  return map;
+}
+
+async function enrichBookingsForAdmin(bookings) {
+  if (!bookings.length) return bookings;
+  const venueIds = [...new Set(bookings.filter((b) => !b.ownerPhone && b.venueId).map((b) => b.venueId))];
+  const userIds = [...new Set(bookings.filter((b) => !b.customerPhone && b.userId).map((b) => b.userId))];
+  const bookingIds = bookings.filter((b) => !b.customerPhone).map((b) => b.id);
+
+  const [venuePhones, paymentContacts] = await Promise.all([
+    lookupVenuePhones(venueIds),
+    lookupPaymentContacts(bookingIds),
+  ]);
+
+  const userPhoneMap = new Map();
+  await Promise.all(userIds.map(async (userId) => {
+    const phone = await lookupAuthUserPhone(userId);
+    if (phone) userPhoneMap.set(userId, phone);
+  }));
+
+  return bookings.map((booking) => ({
+    ...booking,
+    customerPhone: booking.customerPhone
+      || paymentContacts.get(booking.id)
+      || userPhoneMap.get(booking.userId)
+      || null,
+    ownerPhone: booking.ownerPhone || venuePhones.get(booking.venueId) || null,
+  }));
+}
+
+async function enrichListingsForAdmin(listings) {
+  if (!listings.length) return listings;
+  const ownerIds = [...new Set(
+    listings
+      .filter((listing) => !String(listing.phone || '').trim() && listing.ownerId)
+      .map((listing) => listing.ownerId),
+  )];
+  const ownerPhoneMap = new Map();
+  await Promise.all(ownerIds.map(async (ownerId) => {
+    const phone = await lookupAuthUserPhone(ownerId);
+    if (phone) ownerPhoneMap.set(ownerId, phone);
+  }));
+
+  return listings.map((listing) => {
+    const submittedPhone = String(listing.phone || '').trim();
+    const ownerAccountPhone = ownerPhoneMap.get(listing.ownerId) || null;
+    const phone = submittedPhone || ownerAccountPhone || '';
+    return {
+      ...listing,
+      phone,
+      ownerPhone: submittedPhone || ownerAccountPhone || null,
+    };
+  });
 }
 
 function requireString(value, field) {
@@ -1189,6 +1327,113 @@ async function proxyClientData(req, path = req.path) {
   }
 }
 
+async function getPaymentLockedBookingSlots(venueId) {
+  const venueSnap = await db.collection('venues').doc(venueId).get();
+  const venue = venueSnap.exists ? toListing(venueSnap) : null;
+  const ownerId = venue?.ownerId || null;
+
+  const snap = await db.collection('bookings').where('venueId', '==', venueId).get();
+  const locked = new Set();
+  for (const doc of snap.docs) {
+    const booking = toBooking(doc);
+    if (booking.status === 'cancelled') continue;
+    if (!['pending', 'confirmed'].includes(booking.status)) continue;
+
+    const isPaid = booking.paymentStatus === 'paid';
+    const isConfirmed = booking.status === 'confirmed';
+    const isHost = ownerId && booking.userId === ownerId;
+    const isAdmin = booking.userId === 'env-admin' || booking.userId === 'admin';
+    if (!isPaid && !isConfirmed && !isHost && !isAdmin) continue;
+
+    for (const raw of String(booking.eventDate || '').split('; ')) {
+      const slot = raw.trim();
+      if (slot) locked.add(slot);
+    }
+  }
+  return locked;
+}
+
+function calendarKeyTouchesLockedSlot(calendarKey, lockedSlot, spaceName = '') {
+  const keyParts = String(calendarKey || '').split('|');
+  const keyDate = keyParts[0];
+  const lockedParts = String(lockedSlot || '').split('|');
+  const lockedDate = lockedParts[0];
+  if (!keyDate || !lockedDate || keyDate !== lockedDate) return false;
+  if (lockedParts.length === 1) return true;
+
+  const lockedSlotType = lockedParts[1];
+  const lockedSpace = lockedParts.length > 2 ? lockedParts[2] : '';
+  const keySlotType = keyParts.length > 1 ? keyParts[1] : '';
+  const keySpace = keyParts.length > 2 ? keyParts[2] : (spaceName || '');
+
+  if (lockedSlotType !== 'day' && lockedSlotType !== 'night') {
+    return true;
+  }
+  if (keySlotType && keySlotType !== 'day' && keySlotType !== 'night') {
+    return true;
+  }
+  if (keySlotType && keySlotType !== lockedSlotType) return false;
+  if (lockedSpace && keySpace && lockedSpace !== keySpace) return false;
+  return true;
+}
+
+function overrideUnlocksPaidSlot(previousOverride, nextOverride) {
+  const wasBlocked = CalendarRateUtils_isBlocked(previousOverride?.status);
+  const nowOpen = !CalendarRateUtils_isBlocked(nextOverride?.status);
+  if (wasBlocked && nowOpen) return true;
+  if (!previousOverride && nowOpen) return true;
+  return false;
+}
+
+function CalendarRateUtils_isBlocked(status) {
+  return status === 'booked' || status === 'day_booked' || status === 'night_booked';
+}
+
+function assertCalendarDoesNotUnlockPaidSlots(beforeSpaces, nextSpaces, lockedSlots) {
+  if (!lockedSlots.size) return;
+  const beforeList = Array.isArray(beforeSpaces) ? beforeSpaces : [];
+  const nextList = Array.isArray(nextSpaces) ? nextSpaces : [];
+  for (let index = 0; index < nextList.length; index += 1) {
+    const beforeSpace = beforeList[index] || {};
+    const nextSpace = nextList[index] || {};
+    const spaceName = nextSpace?.name || beforeSpace?.name || '';
+    const beforeOverrides = beforeSpace.calendarOverrides || {};
+    const nextOverrides = nextSpace.calendarOverrides || {};
+    for (const [calendarKey, nextOverride] of Object.entries(nextOverrides)) {
+      if (!overrideUnlocksPaidSlot(beforeOverrides[calendarKey], nextOverride)) continue;
+      for (const lockedSlot of lockedSlots) {
+        if (calendarKeyTouchesLockedSlot(calendarKey, lockedSlot, spaceName)) {
+          const error = new Error('Cannot change a slot reserved by an active paid booking. Cancel and refund the order first.');
+          error.status = 409;
+          throw error;
+        }
+      }
+    }
+  }
+}
+
+function mergeProtectedCalendarOverrides(beforeSpaces, nextSpaces, lockedSlots) {
+  if (!lockedSlots.size) return nextSpaces;
+  return (nextSpaces || []).map((space, index) => {
+    const beforeSpace = (beforeSpaces || [])[index] || {};
+    const beforeOverrides = beforeSpace.calendarOverrides || {};
+    const nextOverrides = { ...(space.calendarOverrides || {}) };
+    const spaceName = space?.name || beforeSpace?.name || '';
+
+    for (const lockedSlot of lockedSlots) {
+      for (const key of Object.keys(nextOverrides)) {
+        if (!calendarKeyTouchesLockedSlot(key, lockedSlot, spaceName)) continue;
+        if (overrideUnlocksPaidSlot(beforeOverrides[key], nextOverrides[key])) {
+          if (beforeOverrides[key]) nextOverrides[key] = beforeOverrides[key];
+          else nextOverrides[key] = { status: 'booked', discountPercent: nextOverrides[key]?.discountPercent || 0 };
+        }
+      }
+    }
+
+    return { ...space, calendarOverrides: nextOverrides };
+  });
+}
+
 function pricingChanges(before, after) {
   const changes = [];
   const add = (field, label, oldValue, newValue) => {
@@ -1294,7 +1539,10 @@ app.get('/api/venues/admin/pending', requireAuth, requireStaff, async (req, res)
     if (!clientResp.ok || data.ok === false) {
       return res.status(502).json({ ok: false, message: data.message || 'Failed to fetch pending from clientbackend.' });
     }
-    res.json(data);
+    const listings = await enrichListingsForAdmin(
+      Array.isArray(data.listings) ? data.listings.map(toListing) : [],
+    );
+    res.json({ ...data, listings });
   } catch (error) {
     return handleError(res, error);
   }
@@ -1319,6 +1567,10 @@ app.get('/api/venues/:venueId/availability', async (req, res) => {
       return res.status(404).json({ ok: false, message: 'Listing not found.' });
     }
     const venue = toListing(venueSnap);
+    const spaceQuery = req.query.space ? String(req.query.space).trim() : '';
+    const primarySpace = spaceQuery && Array.isArray(venue.spaces) && venue.spaces.length
+      ? (venue.spaces.find((space) => space.name === spaceQuery) || venue.spaces[0])
+      : (venue.spaces?.[0] || {});
 
     const prefix = `${year}-${String(month).padStart(2, '0')}`;
     const snap = await db.collection('bookings')
@@ -1350,7 +1602,6 @@ app.get('/api/venues/:venueId/availability', async (req, res) => {
         }
       }
     });
-    const primarySpace = venue.spaces?.[0] || {};
     const overrides = primarySpace.calendarOverrides || {};
     const originalRate = Number(primarySpace.dayPrice || primarySpace.nightPrice || venue.priceWithGst || venue.basePrice || 0);
     const originalDayRate = primarySpace.dayPrice ? Number(primarySpace.dayPrice) : null;
@@ -1447,13 +1698,17 @@ app.put('/api/venues/:id', requireAuth, writeLimiter, async (req, res) => {
     try {
       const venueRef = db.collection('venues').doc(req.params.id);
       const currentSnap = await venueRef.get();
+      const calendarSource = req.body?.modifiedByAdmin === true
+        ? 'admin_calendar'
+        : 'owner_calendar';
+
       if (currentSnap.exists) {
         const before = toListing(currentSnap);
-        const updatedSpaces = Array.isArray(req.body.spaces) ? req.body.spaces : before.spaces;
+        const lockedSlots = await getPaymentLockedBookingSlots(req.params.id);
+        let updatedSpaces = Array.isArray(req.body.spaces) ? req.body.spaces : before.spaces;
+        updatedSpaces = mergeProtectedCalendarOverrides(before.spaces, updatedSpaces, lockedSlots);
+        assertCalendarDoesNotUnlockPaidSlots(before.spaces, updatedSpaces, lockedSlots);
         const after = cleanForFirestore({ ...before, spaces: updatedSpaces, updatedAt: nowIso() });
-        const calendarSource = req.body?.modifiedByAdmin === true
-          ? 'admin_calendar'
-          : 'owner_calendar';
         await writeVenueWithHistory({
           venueId: req.params.id,
           before,
@@ -1466,8 +1721,30 @@ app.put('/api/venues/:id', requireAuth, writeLimiter, async (req, res) => {
         // Optionally notify the proxy asynchronously, but don't depend on its response for the spaces data
         proxyClientData(req).catch(console.error);
 
-        return res.json({ ok: true, message: 'Calendar updated and published successfully.' });
+        return res.json({
+          ok: true,
+          message: 'Calendar updated and published successfully.',
+          listing: after,
+        });
       }
+
+      const result = await proxyClientData(req);
+      if (result.status < 300 && result.data?.ok === true && result.data?.listing) {
+        try {
+          const listing = cleanForFirestore(result.data.listing);
+          await writeVenueWithHistory({
+            venueId: req.params.id,
+            before: null,
+            after: listing,
+            actor: req.auth.user,
+            source: calendarSource,
+          });
+          await syncVenueToPayments(listing);
+        } catch (seedError) {
+          console.error('Calendar Firebase seed failed:', seedError);
+        }
+      }
+      return res.status(result.status).json(result.data);
     } catch (error) {
       console.error('Approved calendar synchronization failed:', error);
       return res.status(502).json({
@@ -1764,6 +2041,87 @@ app.get('/api/bookings/received', requireAuth, async (req, res) => {
 });
 
 
+function parseBookingSlot(raw) {
+  const parts = String(raw || '').split('|').map((p) => p.trim()).filter(Boolean);
+  const dateString = parts[0] || '';
+  if (parts.length <= 1) return { dateString, slotString: null, spaceName: null };
+  if (parts.length === 2) {
+    const token = parts[1];
+    if (token === 'day' || token === 'night' || token.includes(':') || token.startsWith('hour_')) {
+      return { dateString, slotString: token, spaceName: null };
+    }
+    return { dateString, slotString: null, spaceName: token };
+  }
+  return { dateString, slotString: parts[1] || null, spaceName: parts[2] || null };
+}
+
+function resolveBookingSpace(venue, spaceName) {
+  const spaces = Array.isArray(venue.spaces) ? venue.spaces : [];
+  if (spaceName) {
+    return spaces.find((space) => space.name === spaceName) || spaces[0] || {};
+  }
+  return spaces[0] || {};
+}
+
+function undiscountedSlotBase(venue, space, slotString) {
+  if (slotString === 'day' && space.dayPrice != null) return Number(space.dayPrice);
+  if (slotString === 'night' && space.nightPrice != null) return Number(space.nightPrice);
+  if (slotString && space.hourlyPrices && space.hourlyPrices[slotString] != null) {
+    return Number(space.hourlyPrices[slotString]);
+  }
+  if (slotString && String(slotString).startsWith('hour_') && space.hourlyPrices) {
+    const hourKey = String(slotString).replace('hour_', '');
+    if (space.hourlyPrices[hourKey] != null) return Number(space.hourlyPrices[hourKey]);
+  }
+  if (space.dayPrice != null || space.nightPrice != null) {
+    if (!slotString) {
+      const day = Number(space.dayPrice || 0);
+      const night = Number(space.nightPrice || 0);
+      if (day > 0 && night > 0) return day + night;
+    }
+    return Number(venue.priceWithGst || venue.basePrice || 0);
+  }
+  return Number(venue.priceWithGst || venue.basePrice || 0);
+}
+
+function clientTotalFromSlotSubtotal(slotSubtotal) {
+  const base = Number(slotSubtotal || 0);
+  const platformFee = base * 0.03;
+  const bookingFee = base * 0.03;
+  const gstAmount = (base + platformFee + bookingFee) * 0.18;
+  return Math.round(base + platformFee + bookingFee + gstAmount);
+}
+
+async function computeBookingQuote(venue, eventDateRaw, discountRules) {
+  const dates = String(eventDateRaw || '').split('; ').map((d) => d.trim()).filter(Boolean);
+  let slotSubtotal = 0;
+  for (const raw of dates) {
+    const { dateString, slotString, spaceName } = parseBookingSlot(raw);
+    const space = resolveBookingSpace(venue, spaceName);
+    const overrides = space.calendarOverrides || {};
+    const override = overrides[dateString] || {};
+    const baseDiscountPercent = Math.max(0, Math.min(100, Number(override.discountPercent || 0)));
+
+    const eventDay = new Date(dateString);
+    const todayDate = new Date(); todayDate.setHours(0, 0, 0, 0);
+    const diffDays = Math.round((eventDay - todayDate) / (1000 * 60 * 60 * 24));
+
+    let autoDiscountPercent = 0;
+    const sortedRules = [...discountRules].sort((a, b) => a.maxDays - b.maxDays);
+    for (const rule of sortedRules) {
+      if (diffDays <= rule.maxDays) {
+        autoDiscountPercent = rule.percent;
+        break;
+      }
+    }
+    const discountPercent = Math.max(baseDiscountPercent, autoDiscountPercent);
+    const baseAmount = undiscountedSlotBase(venue, space, slotString);
+    slotSubtotal += Math.round(baseAmount * (1 - discountPercent / 100));
+  }
+  const totalWithFees = clientTotalFromSlotSubtotal(slotSubtotal);
+  return { slotSubtotal, totalWithFees };
+}
+
 app.post('/api/bookings', requireAuth, writeLimiter, async (req, res) => {
   try {
     const venueId = requireString(req.body.venueId, 'Venue');
@@ -1786,12 +2144,6 @@ app.post('/api/bookings', requireAuth, writeLimiter, async (req, res) => {
       return res.status(429).json({ ok: false, message: 'You cannot create more than 5 bookings per day.' });
     }
 
-    // Parse eventDate string like "YYYY-MM-DD|day" or "YYYY-MM-DD|night" or "YYYY-MM-DD|00:00-00:59|Main Space"
-    // Handle multiple dates joined by "; "
-    const dates = eventDateRaw.split('; ');
-    let totalServerFinalAmount = 0;
-
-    // Auto-discount: use dynamic global rules
     const discSnap = await db.collection('settings').doc('discounts').get();
     const discountRules = discSnap.exists && discSnap.data().rules ? discSnap.data().rules : [
       { maxDays: 1, percent: 60 },
@@ -1799,55 +2151,14 @@ app.post('/api/bookings', requireAuth, writeLimiter, async (req, res) => {
       { maxDays: 13, percent: 30 }
     ];
 
-    for (const d of dates) {
-      const [dateString, slotString, spaceName] = d.split('|');
-      const primarySpace = (spaceName ? venue.spaces?.find(s => s.name === spaceName) : venue.spaces?.[0]) || venue.spaces?.[0] || {};
-      const overrides = primarySpace.calendarOverrides || {};
-      const override = overrides[dateString] || {};
-      const baseDiscountPercent = Math.max(0, Math.min(100, Number(override.discountPercent || 0)));
-
-      const eventDay = new Date(dateString);
-      const todayDate = new Date(); todayDate.setHours(0, 0, 0, 0);
-      const diffDays = Math.round((eventDay - todayDate) / (1000 * 60 * 60 * 24));
-
-      let autoDiscountPercent = 0;
-      const sortedRules = [...discountRules].sort((a, b) => a.maxDays - b.maxDays);
-      for (const rule of sortedRules) {
-        if (diffDays <= rule.maxDays) {
-          autoDiscountPercent = rule.percent;
-          break;
-        }
-      }
-      const discountPercent = Math.max(baseDiscountPercent, autoDiscountPercent);
-
-      let baseAmount = venue.priceWithGst || venue.basePrice || 0;
-      if (slotString === 'day' && primarySpace.dayPrice) {
-        baseAmount = Number(primarySpace.dayPrice);
-      } else if (slotString === 'night' && primarySpace.nightPrice) {
-        baseAmount = Number(primarySpace.nightPrice);
-      } else if (slotString && primarySpace.hourlyPrices && primarySpace.hourlyPrices[slotString]) {
-        baseAmount = Number(primarySpace.hourlyPrices[slotString]);
-      } else if (slotString && slotString.startsWith('hour_') && primarySpace.hourlyPrices) {
-        const hourKey = slotString.replace('hour_', '');
-        if (primarySpace.hourlyPrices[hourKey]) {
-          baseAmount = Number(primarySpace.hourlyPrices[hourKey]);
-        }
-      } else if (primarySpace.dayPrice || primarySpace.nightPrice) {
-        baseAmount = venue.priceWithGst || venue.basePrice || 0;
-      }
-
-      totalServerFinalAmount += Math.round(baseAmount * (1 - discountPercent / 100));
+    const { slotSubtotal, totalWithFees } = await computeBookingQuote(venue, eventDateRaw, discountRules);
+    const clientAmount = req.body.amount != null ? Number(req.body.amount) : null;
+    let finalAmount = totalWithFees;
+    if (clientAmount != null && clientAmount > 0 && Math.abs(clientAmount - totalWithFees) <= 1) {
+      finalAmount = Math.round(clientAmount);
     }
 
-    // If the client sent an amount (their computed discounted total), trust it only
-    // when it's lower than our server-computed value (plus 1 rupee for rounding variance)
-    const clientAmount = req.body.amount != null ? Number(req.body.amount) : null;
-    const serverFinalAmount = totalServerFinalAmount;
-    const finalAmount = (clientAmount != null && clientAmount > 0 && clientAmount <= serverFinalAmount + 1)
-      ? Math.round(clientAmount)
-      : serverFinalAmount;
-
-    console.log(`[BOOKING CREATE] venueId=${venueId} eventDate=${eventDateRaw} serverFinal=${serverFinalAmount} clientSent=${clientAmount} -> finalAmount=${finalAmount}`);
+    console.log(`[BOOKING CREATE] venueId=${venueId} eventDate=${eventDateRaw} slotSubtotal=${slotSubtotal} totalWithFees=${totalWithFees} clientSent=${clientAmount} -> finalAmount=${finalAmount}`);
 
     const duplicate = await db.collection('bookings')
       .where('venueId', '==', venueId)
@@ -1914,14 +2225,20 @@ app.post('/api/bookings', requireAuth, writeLimiter, async (req, res) => {
       });
     }
 
+    const customerPhone = normalizePhone(req.body.customerPhone)
+      || phoneFromIdentifier(req.auth.user.identifier)
+      || await lookupAuthUserPhone(req.auth.user.id);
+    const ownerPhone = pickVenuePhone(venue);
+
     const bookingData = {
       venueId,
       venueName: venue.name,
       customerName: req.auth.user.name,
       userId: req.auth.user.id,
-      customerPhone: req.body.customerPhone || null,
+      customerPhone: customerPhone || null,
       ownerId: venue.ownerId,
       ownerName: venue.ownerName,
+      ownerPhone: ownerPhone || null,
       venueAddress: venue.address,
       amount: finalAmount,
       guests: req.body.guests == null ? null : Number(req.body.guests),
@@ -1945,6 +2262,11 @@ app.post('/api/bookings', requireAuth, writeLimiter, async (req, res) => {
         venueName: venue.name,
         userId: req.auth.user.id,
         customerName: req.auth.user.name,
+        customerPhone: customerPhone || null,
+        ownerId: venue.ownerId,
+        ownerName: venue.ownerName || null,
+        ownerPhone: ownerPhone || null,
+        venueAddress: venue.address || null,
         amount: finalAmount,
         status: 'pending',
         paymentStatus: 'unpaid',
@@ -2104,13 +2426,23 @@ app.post('/api/payments/verify', requireAuth, async (req, res) => {
       const bookingId = req.body.id || req.body.bookingId;
       if (bookingId) {
         try {
+          const paymentContact = normalizePhone(result.data?.contact);
           const updateData = {
             paymentStatus: 'paid',
             status: 'pending',
             paidAt: nowIso(),
+            ...(paymentContact ? { customerPhone: paymentContact } : {}),
           };
           console.log(`[PAYMENTS VERIFY] Syncing booking ${bookingId} to Firestore:`, updateData);
           await db.collection('bookings').doc(bookingId).set(updateData, { merge: true });
+          if (supabaseAdmin) {
+            await supabaseAdmin.from('bookings').update({
+              paymentStatus: 'paid',
+              paidAt: nowIso(),
+              status: 'pending',
+              ...(paymentContact ? { customerPhone: paymentContact } : {}),
+            }).eq('id', bookingId);
+          }
         } catch (e) {
           console.error(`[PAYMENTS VERIFY] Failed to sync booking ${bookingId} to Firestore:`, e);
         }
@@ -2172,9 +2504,11 @@ async function listAllAdminListings(req) {
 app.get('/api/admin/listings/recent', requireAuth, requireStaff, async (req, res) => {
   try {
     const limit = clampInt(req.query.limit, 12, 1, 50);
-    const listings = (await listAllAdminListings(req))
-      .sort((a, b) => String(b.updatedAt || b.submittedAt || '').localeCompare(String(a.updatedAt || a.submittedAt || '')))
-      .slice(0, limit);
+    const listings = await enrichListingsForAdmin(
+      (await listAllAdminListings(req))
+        .sort((a, b) => String(b.updatedAt || b.submittedAt || '').localeCompare(String(a.updatedAt || a.submittedAt || '')))
+        .slice(0, limit),
+    );
     res.json({ ok: true, message: 'Listings loaded.', listings });
   } catch (error) {
     return handleError(res, error);
@@ -2187,9 +2521,11 @@ app.get('/api/admin/listings', requireAuth, requireStaff, async (req, res) => {
   const status = String(req.query.status || 'all');
   const q = String(req.query.q || '').toLowerCase();
   try {
-    const listings = (await listAllAdminListings(req))
-      .filter((listing) => status === 'all' || listing.status === status)
-      .filter((listing) => !q || `${listing.name} ${listing.address} ${listing.ownerEmail || ''}`.toLowerCase().includes(q));
+    const listings = await enrichListingsForAdmin(
+      (await listAllAdminListings(req))
+        .filter((listing) => status === 'all' || listing.status === status)
+        .filter((listing) => !q || `${listing.name} ${listing.address} ${listing.ownerEmail || ''} ${listing.phone || ''}`.toLowerCase().includes(q)),
+    );
     const start = (page - 1) * limit;
     res.json({
       ok: true,
@@ -2210,10 +2546,11 @@ app.get('/api/admin/bookings', requireAuth, requireBookingOperator, async (req, 
   const status = String(req.query.status || 'all');
   const q = String(req.query.q || '').toLowerCase();
   const snap = await db.collection('bookings').orderBy('bookedAt', 'desc').get();
-  const bookings = snap.docs.map(toBooking)
-    .filter((booking) => canAccessOperationalBooking(req, booking))
-    .filter((booking) => status === 'all' || booking.status === status)
-    .filter((booking) => !q || `${booking.venueName} ${booking.customerName}`.toLowerCase().includes(q));
+  const bookings = (await enrichBookingsForAdmin(
+    snap.docs.map(toBooking)
+      .filter((booking) => canAccessOperationalBooking(req, booking))
+      .filter((booking) => status === 'all' || booking.status === status),
+  )).filter((booking) => !q || `${booking.venueName} ${booking.customerName} ${booking.customerPhone || ''} ${booking.ownerPhone || ''}`.toLowerCase().includes(q));
   const start = (page - 1) * limit;
   res.json({
     ok: true,
@@ -2240,7 +2577,13 @@ app.get('/api/admin/bookings/calendar', requireAuth, requireBookingOperator, asy
     if (req.query.venueId && booking.venueId !== req.query.venueId) continue;
     grouped.set(booking.eventDate, [...(grouped.get(booking.eventDate) || []), booking]);
   }
-  const days = [...grouped.entries()].map(([date, bookings]) => ({ date, count: bookings.length, bookings }));
+  const days = await Promise.all(
+    [...grouped.entries()].map(async ([date, dayBookings]) => ({
+      date,
+      count: dayBookings.length,
+      bookings: await enrichBookingsForAdmin(dayBookings),
+    })),
+  );
   res.json({ ok: true, message: 'Calendar loaded.', year, month, days });
 });
 
@@ -2305,8 +2648,11 @@ app.get('/api/admin/payments', requireAuth, requireStaff, async (req, res) => {
       }
     }));
 
+    const enrichedBookings = await enrichBookingsForAdmin([...bookingMap.values()]);
+    const enrichedBookingMap = new Map(enrichedBookings.map((booking) => [booking.id, booking]));
+
     const orders = payments.map((payment) => {
-      const booking = bookingMap.get(payment.referenceId) || null;
+      const booking = enrichedBookingMap.get(payment.referenceId) || bookingMap.get(payment.referenceId) || null;
       const breakdown = paymentBreakdown(payment, booking);
       return {
         ...payment,
@@ -2317,6 +2663,7 @@ app.get('/api/admin/payments', requireAuth, requireStaff, async (req, res) => {
           address: booking.venueAddress || null,
           ownerId: booking.ownerId || null,
           ownerName: booking.ownerName || null,
+          phone: booking.ownerPhone || null,
         } : null,
         customer: booking ? {
           id: booking.userId || payment.userId || null,
@@ -2375,7 +2722,8 @@ app.post('/api/admin/bookings/:bookingId/confirm', requireAuth, requireBookingOp
       updatedAt: nowIso(),
     }, { merge: true });
     const snap = await ref.get();
-    res.json({ ok: true, message: 'Booking confirmed. Ticket generated.', booking: toBooking(snap) });
+    const [booking] = await enrichBookingsForAdmin([toBooking(snap)]);
+    res.json({ ok: true, message: 'Booking confirmed. Ticket generated.', booking });
   } catch (error) {
     return handleError(res, error);
   }
@@ -2393,7 +2741,8 @@ app.post('/api/admin/bookings/:bookingId/ticket', requireAuth, requireBookingOpe
     await ref.set({ ticketImage: req.body.ticketImage || null, status: 'confirmed', confirmedAt: nowIso() }, { merge: true });
 
     const snap = await ref.get();
-    res.json({ ok: true, message: 'Ticket uploaded and booking approved.', booking: toBooking(snap) });
+    const [booking] = await enrichBookingsForAdmin([toBooking(snap)]);
+    res.json({ ok: true, message: 'Ticket uploaded and booking approved.', booking });
   } catch (error) {
     return handleError(res, error);
   }
