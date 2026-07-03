@@ -698,6 +698,10 @@ function toListing(doc) {
     rejectionReason: data.rejectionReason || null,
     approvedAt: data.approvedAt || null,
     updatedAt: data.updatedAt || null,
+    description: data.description || '',
+    coverImage: data.coverImage || '',
+    morningTime: data.morningTime || '08:00 - 18:00',
+    eveningTime: data.eveningTime || '19:00 - 07:00',
   };
 }
 
