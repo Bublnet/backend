@@ -1757,8 +1757,32 @@ app.put('/api/venues/:id', requireAuth, writeLimiter, async (req, res) => {
   // Normal full listing update
   const result = await proxyClientData(req);
   if (result.status < 300 && result.data?.ok === true) {
-    // If it was a normal update that somehow got here, we don't need to do anything special
-    // unless there's a specific requirement to sync it immediately to venues.
+    const isStaff = ['admin', 'staff'].includes(req.auth.user.role);
+    const isAdminEdit = isStaff || req.body?.modifiedByAdmin === true;
+    const listing = result.data?.listing;
+    if (isAdminEdit && listing?.id) {
+      try {
+        const venueRef = db.collection('venues').doc(listing.id);
+        const currentSnap = await venueRef.get();
+        const shouldSync = currentSnap.exists || listing.status === 'approved';
+        if (shouldSync) {
+          const before = currentSnap.exists ? toListing(currentSnap) : null;
+          const after = cleanForFirestore(listing);
+          await writeVenueWithHistory({
+            venueId: listing.id,
+            before,
+            after,
+            actor: req.auth.user,
+            source: 'admin_edit',
+          });
+          if (after.status === 'approved') {
+            await syncVenueToPayments(after);
+          }
+        }
+      } catch (syncError) {
+        console.error('Admin listing Firebase sync failed:', syncError);
+      }
+    }
   }
   res.status(result.status).json(result.data);
 });
